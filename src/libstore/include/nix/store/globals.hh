@@ -662,13 +662,32 @@ public:
         this, {}, "sandbox-paths",
         R"(
           A list of paths bind-mounted into Nix sandbox environments. Use the
-          syntax `target[=source][:ro][?]` to control the mount:
+          syntax `target[=source][:ro][:idmap=IDMAP][?]` to control the mount:
 
           - `=source` will mount a different path at target location; for
             instance, `/bin=/nix-bin` will mount the path `/nix-bin` as `/bin`
             inside the sandbox.
 
           - `:ro` makes the mount read-only (Linux only).
+
+          - `:idmap=IDMAP` will make an ID-mapped mount. For more details see
+            `X-mount.idmap` in `mount(8)`. The syntax for `IDMAP` is
+            `type=mount[-host[-range]]` where type is either `u` or `g`, `mount`
+            defines the first ID of the range mapped inside the sandbox,
+            `host` is the first ID outside the sandbox (same as `mount` if unset)
+            and `range` is the size of mapped ID range (1 if unset). Multiple
+            mappings can be given by separating them with ",". For example,
+            `:idmap=u=1000-30000,g=100-30000-1` will map UID 1000 and GID 100
+            (primary IDs of the build user) to ID 30000 in the host
+            filesystem.
+
+            Note that by default only UID 1000 and GID 100 are mapped in the
+            sandbox. To make use of other GIDs this should be combined with
+            [`supplementary-groups`](#conf-supplementary-groups`). Unmapped
+            IDs are not usable in the sandbox.
+
+            Linux 5.12+ only. Only some filesystems support ID-mapped mounts.
+            See `mount_setattr(2)` for a list.
 
           - `?` makes it not an error if *source* does not exist; for example,
             `/dev/nvidiactl?` specifies that `/dev/nvidiactl` will only be

@@ -173,9 +173,11 @@ struct LinuxDerivationBuilder : DerivationBuilderImpl
 struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 {
     /**
-     * Pipe for synchronising updates to the builder namespaces.
+     * Pipe for synchronising updates to the builder namespaces / from the
+     * namespace.
      */
     Pipe userNamespaceSync;
+    Pipe builderSync;
 
     /**
      * The mount namespace and user namespace of the builder, used to add additional
@@ -201,6 +203,8 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
     std::shared_ptr<AutoDelete> autoDelChroot;
 
     PathsInChroot pathsInChroot;
+
+    std::unordered_map<std::string, int> mountIDMapNamespaces;
 
     /**
      * The cgroup of the builder, if any.
@@ -234,6 +238,10 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
      * Keys are host/parent gid's (can't have duplicates obviously). Values
      * are the mapped/target (gid, name) pairs. Each mapped gid (name) may
      * only appear once in the result.
+     *
+     * TODO this should interact with ID-mapped mounts, because ID-mapped
+     * mounts aren't really useful unless the IDs that are mapped by ID-mapped
+     * mounts are also mapped in the user namespace.
      */
     std::map<gid_t, std::tuple<gid_t, std::string>> getSupplementaryGIDMap()
     {
@@ -509,6 +517,55 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             auto p = store.printStorePath(i);
             pathsInChroot.insert_or_assign(p, store.toRealPath(p));
         }
+
+        createMountIDMapNamespaces();
+    }
+
+    void createMountIDMapNamespaces()
+    {
+        for (auto & p : pathsInChroot) {
+            if (p.second.idmap.empty())
+                continue;
+            if (mountIDMapNamespaces.find(p.second.idmap) == mountIDMapNamespaces.end()) {
+                mountIDMapNamespaces[p.second.idmap] = createUsernamespaceWithMappings(p.second.idmap);
+            }
+        }
+    }
+
+    void mountIDMapPaths()
+    {
+       /* The kernel has (too) many small & significant security rules as to
+        * what's okay under which conditions when CLONE_(USER|NS|PID) et al.
+        * are involved. There is a very reasonable explanation why
+        * mount_setattr(2) gives EPERM if it goes inside the sandbox's user
+        * namespace (for sure). I'd be upset too, being compared to some
+        * mount(2) all the time!
+        *
+        * Successful mounting is really a secondary concern, though. Only just
+        * producing ID-maps for mount_setattr has as many gotchas as user
+        * namespaces in general. :) */
+        Pid child(startProcess([&]()
+        {
+         /* if (usingUserNamespace && (setns(sandboxUserNamespace.get(), 0) == -1))
+                throw SysError("idmap-mount: entering sandbox user namespace"); */
+
+            if (setns(sandboxMountNamespace.get(), 0) == -1)
+                throw SysError("idmap-mount: entering sandbox mount namespace");
+
+            for (auto & p : pathsInChroot) {
+                if (p.second.idmap.empty())
+                    continue;
+                auto fd = mountIDMapNamespaces[p.second.idmap];
+                if (fcntl(fd, F_GETFD) == -1)
+                    throw SysError("fd-send: %d: invalid at init-parent: '%s'", fd, p.second.source);
+
+                bindMountWithIDMap(p.second.source, chrootRootDir + p.first, fd, p.second.rdonly);
+            }
+            _exit(0);
+        }));
+        int status = child.wait();
+        if (status != 0)
+            throw Error("could not add id-mapped mounts to sandbox");
     }
 
     Strings getPreBuildHookArgs() override
@@ -560,6 +617,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         */
 
         userNamespaceSync.create();
+        builderSync.create();
 
         usingUserNamespace = userNamespacesSupported();
 
@@ -575,6 +633,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 
         Pid helper = startProcess([&]() {
             sendPid.readSide.close();
+            builderSync.readSide.close();
 
             /* We need to open the slave early, before
                CLONE_NEWUSER. Otherwise we get EPERM when running as
@@ -686,17 +745,24 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             writeFile(*cgroup + "/cgroup.procs", fmt("%d", (pid_t) pid));
 
         /* Signal the builder that we've updated its user namespace. */
-        writeFull(userNamespaceSync.writeSide.get(), "1");
+        writeLine(userNamespaceSync.writeSide.get(), "1");
+
+        if (readLine(builderSync.readSide.get(), true) != "C")
+            throw Error("builder chroot preparation failed");
+
+        /* Mount paths that need ID-mapping */
+        mountIDMapPaths();
+        /* Signal the builder to proceed with chroot and build. */
+        writeLine(userNamespaceSync.writeSide.get(), "1");
     }
 
     void enterChroot() override
     {
         userNamespaceSync.writeSide = -1;
 
-        if (drainFD(userNamespaceSync.readSide.get()) != "1")
+        if (readLine(userNamespaceSync.readSide.get(), true) != "1")
             throw Error("user namespace initialisation failed");
 
-        userNamespaceSync.readSide = -1;
 
         if (derivationType.isSandboxed()) {
 
@@ -821,8 +887,8 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 chmod_(dst, 0555);
             } else
 #  endif
-            {
-                doBind(i.second.source, chrootRootDir + i.first, i.second.optional);
+            if (i.second.idmap == "") {
+                doBind(i.second.source, chrootRootDir + i.first, i.second.optional, i.second.rdonly);
             }
         }
 
@@ -873,6 +939,13 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         /* Make /etc unwritable */
         if (!drvOptions.useUidRange(drv))
             chmod_(chrootRootDir + "/etc", 0555);
+
+        /* Signal parent just prior to chroot. */
+        writeLine(builderSync.writeSide.get(), "C");
+
+        /* Wait for parent before continuing to unshare mount and cgroup namespaces. */
+        if (readLine(userNamespaceSync.readSide.get(), true) != "1")
+            throw Error("preparing chroot failed");
 
         /* Unshare this mount namespace. This is necessary because
            pivot_root() below changes the root of the mount
