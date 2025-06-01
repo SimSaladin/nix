@@ -173,9 +173,11 @@ struct LinuxDerivationBuilder : DerivationBuilderImpl
 struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 {
     /**
-     * Pipe for synchronising updates to the builder namespaces.
+     * Pipe for synchronising updates to the builder namespaces / from the
+     * namespace.
      */
     Pipe userNamespaceSync;
+    Pipe builderSync;
 
     /**
      * The mount namespace and user namespace of the builder, used to add additional
@@ -201,6 +203,10 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
     std::shared_ptr<AutoDelete> autoDelChroot;
 
     PathsInChroot pathsInChroot;
+
+    IDMapper idMapper;
+
+    std::set<std::string> mountIDMaps;
 
     /**
      * The cgroup of the builder, if any.
@@ -464,8 +470,13 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             "nixbld:!:%d:\n", sandboxGid());
 
         if (setSupplementaryGroups)
-            for (const auto & [parent_gid, mapped] : getSupplementaryGIDMap())
+            for (const auto & [parent_gid, mapped] : getSupplementaryGIDMap()) {
                 oss << fmt("%s:x:%d:nixbld\n", std::get<1>(mapped), std::get<0>(mapped));
+                idMapper.add_explicit({
+                        .type = IDMapType::GID,
+                        .mapped_id = std::get<0>(mapped),
+                        .host_id = parent_gid });
+            }
 
         writeFile(chrootRootDir + "/etc/group", oss.str());
 
@@ -516,6 +527,81 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         for (auto & i : inputPaths) {
             auto p = store.printStorePath(i);
             pathsInChroot.insert_or_assign(p, store.toRealPath(p));
+        }
+
+        createMountIDMapNamespaces();
+    }
+
+    void createMountIDMapNamespaces()
+    {
+        debug("setting up idmap user namespaces");
+        for (auto & p : pathsInChroot) {
+            if (p.second.idmap.empty())
+                continue;
+            if (mountIDMaps.count(p.second.idmap) == 0) {
+                mountIDMaps.insert(p.second.idmap);
+                idMapper.add_fallback(p.second.idmap);
+            }
+        }
+    }
+
+    void _mountIDMapPaths()
+    {
+        std::map<std::string, AutoCloseFD> fds;
+        //for (auto & p : pathsInChroot) {
+        //    if (p.second.idmap.empty())
+        //        continue;
+        while (true) {
+            auto target = readLine(builderSync.readSide.get());
+            if (target == "M") continue;
+            if (target == "\2") break;
+            auto p = pathsInChroot[target];
+            if (fds.count(p.idmap) == 0)
+                fds[p.idmap] = createUsernamespaceWithMappings(p.idmap, buildUser->getUID(), buildUser->getGID());
+            bindMountWithIDMap(p.source, chrootRootDir + target, fds[p.idmap].get(), p.optional, p.rdonly);
+        }
+    }
+
+
+    /* ID-mapped bind mounts. Setup these from the parent (initial)
+     * namespace, because here we still have all the needed capabilities and
+     * are not constrained by the sandbox user ns. For every unique ID-map a
+     * user namespace is created with the specified mappings. Various criteria
+     * are required:
+     *
+     * - The caller needs to be owner of current user namespace.
+     * - The caller UID/GID has to be mapped in the current namespace.
+     * - The mapped user IDs (group IDs) must in turn have a mapping in the parent user namespace.
+     * - Mapping UID 0 requires CAP_SETFCAP
+     * - To write maps for other than effective UID/GID, CAP_SETUID/GID is needed.
+     * - A child user namespace inherits the /proc/pid/setgroups setting from its parent and can't modify it.
+     *
+     * Mounts are performed in the sandbox's mount namespace.
+     */
+    void mountIDMapPaths()
+    {
+        //if (mountIDMaps.empty()) return;
+        Pipe exitPipe;
+        exitPipe.create();
+        Pid child(startProcess([&]()
+        {
+            exitPipe.readSide.close();
+            try {
+                if (setns(sandboxMountNamespace.get(), 0) == -1)
+                    throw SysError("idmap-mount: entering sandbox mount namespace");
+
+                _mountIDMapPaths();
+            } catch (Error & e) {
+                writeFull(exitPipe.writeSide.get(), e.message());
+                _exit(1);
+            }
+            _exit(0);
+        }));
+        exitPipe.writeSide = -1;
+        int status = child.wait();
+        if (status != 0) {
+            auto msg = readFile(exitPipe.readSide.get());
+            throw Error("could not add id-mapped mounts to sandbox: %s", msg);
         }
     }
 
@@ -568,6 +654,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         */
 
         userNamespaceSync.create();
+        builderSync.create();
 
         usingUserNamespace = userNamespacesSupported();
 
@@ -575,14 +662,16 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         // certain conditions (root permissions).
         std::vector<gid_t> supplementaryGroups;
         if (setSupplementaryGroups)
-            for (const auto & [parent_gid, mapped] : getSupplementaryGIDMap())
+            for (const auto & [parent_gid, mapped] : getSupplementaryGIDMap()) {
                 supplementaryGroups.push_back(std::get<0>(mapped));
+            }
 
         Pipe sendPid;
         sendPid.create();
 
         Pid helper = startProcess([&]() {
             sendPid.readSide.close();
+            builderSync.readSide.close();
 
             /* We need to open the slave early, before
                CLONE_NEWUSER. Otherwise we get EPERM when running as
@@ -618,6 +707,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         });
 
         sendPid.writeSide.close();
+        builderSync.writeSide.close();
 
         if (helper.wait() != 0) {
             processSandboxSetupMessages();
@@ -643,22 +733,16 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
             uid_t nrIds = buildUser ? buildUser->getUIDCount() : 1;
 
-            writeFile("/proc/" + std::to_string(pid) + "/uid_map", fmt("%d %d %d", sandboxUid(), hostUid, nrIds));
+            // Primary UID/GID
+            idMapper.add_explicit({.type = IDMapType::UID, .mapped_id = sandboxUid(), .host_id = hostUid, .range = nrIds});
+            idMapper.add_explicit({.type = IDMapType::GID, .mapped_id = sandboxGid(), .host_id = hostGid, .range = nrIds});
+
+            writeIDMapFile("/proc/" + std::to_string(pid) + "/uid_map", idMapper.collect(IDMapType::UID), IDMapType::UID);
 
             if (!buildUser || buildUser->getUIDCount() == 1)
                 writeFile("/proc/" + std::to_string(pid) + "/setgroups", "deny");
 
-            std::ostringstream oss;
-
-            // Primary GID mapping
-            oss << fmt("%d %d %d", sandboxGid(), hostGid, nrIds);
-
-            if (setSupplementaryGroups)
-                // Supplementary GIDs one by one
-                for (const auto & [parent_gid, mapped] : getSupplementaryGIDMap())
-                    oss << fmt("\n%d %d 1", std::get<0>(mapped), parent_gid);
-
-            writeFile("/proc/" + std::to_string(pid) + "/gid_map", oss.str());
+            writeIDMapFile("/proc/" + std::to_string(pid) + "/gid_map", idMapper.collect(IDMapType::GID), IDMapType::GID);
         } else {
             debug("note: not using a user namespace");
             if (!buildUser)
@@ -694,17 +778,34 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             writeFile(*cgroup + "/cgroup.procs", fmt("%d", (pid_t) pid));
 
         /* Signal the builder that we've updated its user namespace. */
-        writeFull(userNamespaceSync.writeSide.get(), "1");
+        writeLine(userNamespaceSync.writeSide.get(), "1");
+
+        /* Need to wait in the background so the builder output is processed */
+        std::thread([&, nsw = std::move(userNamespaceSync.writeSide)]() mutable {
+            Finally cleanup([&nsw]() { nsw.close(); });
+            try {
+                while (true) {
+                    auto in = readLine(builderSync.readSide.get(), true); // != "C")
+                    if (in == "C") break;
+                    else if (in == "\2") continue;
+                    else if (in == "M") mountIDMapPaths(); /* Mount paths that need ID-mapping */
+                    else throw Error("builder chroot preparation failed: %s", in);
+                }
+                /* Signal the builder to proceed with chroot and build. */
+                writeLine(nsw.get(), "1");
+            } catch (Error & e) {
+                writeFull(nsw.get(), fmt("\1\n%s", e.message()));
+            }
+        }).detach();
     }
 
     void enterChroot() override
     {
         userNamespaceSync.writeSide = -1;
 
-        if (drainFD(userNamespaceSync.readSide.get()) != "1")
+        if (readLine(userNamespaceSync.readSide.get(), true) != "1")
             throw Error("user namespace initialisation failed");
 
-        userNamespaceSync.readSide = -1;
 
         if (derivationType.isSandboxed()) {
 
@@ -829,10 +930,14 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 chmod_(dst, 0555);
             } else
 #  endif
-            {
-                doBind(i.second.source, chrootRootDir + i.first, i.second.optional);
+            if (i.second.idmap == "") {
+                doBind(i.second.source, chrootRootDir + i.first, i.second.optional, i.second.rdonly);
+            } else {
+                writeLine(builderSync.writeSide.get(), "M");
+                writeLine(builderSync.writeSide.get(), i.first);
             }
         }
+        writeLine(builderSync.writeSide.get(), "\2");
 
         /* Bind a new instance of procfs on /proc. */
         createDirs(chrootRootDir + "/proc");
@@ -881,6 +986,14 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         /* Make /etc unwritable */
         if (!drvOptions.useUidRange(drv))
             chmod_(chrootRootDir + "/etc", 0555);
+
+        /* Signal parent just prior to chroot. */
+        writeLine(builderSync.writeSide.get(), "C");
+
+        /* Wait for parent before continuing to unshare mount and cgroup namespaces. */
+        if (readLine(userNamespaceSync.readSide.get(), true) != "1") {
+            throw Error(readFile(userNamespaceSync.readSide.get()));
+        }
 
         /* Unshare this mount namespace. This is necessary because
            pivot_root() below changes the root of the mount
