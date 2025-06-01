@@ -307,6 +307,39 @@ unsigned int MaxBuildJobsSetting::parse(const std::string & str) const
     }
 }
 
+#ifdef __linux__
+template<> struct BaseSetting<SupplementaryGroups>::trait
+{
+    static constexpr bool appendable = true;
+};
+
+template<> SupplementaryGroups BaseSetting<SupplementaryGroups>::parse(const std::string & str) const
+{
+    return SupplementaryGroup::parseArray(str);
+}
+
+template<> void BaseSetting<SupplementaryGroups>::appendOrSet(SupplementaryGroups newValue, bool append)
+{
+    if (!append) {
+        value = std::move(newValue);
+    } else {
+        value.insert(value.end(), newValue.begin(), newValue.end());
+        for (auto i0 = value.begin(); i0 != value.end(); ++i0)
+            for (auto it = i0 + 1; it != value.end();)
+                if (i0->isConflict(*it))
+                    it = value.erase(it);
+                else
+                    ++it;
+    }
+}
+
+template<> std::string BaseSetting<SupplementaryGroups>::to_string() const
+{
+    return nlohmann::json(value).dump();
+}
+
+template class BaseSetting<SupplementaryGroups>;
+#endif
 
 static void preloadNSS()
 {
