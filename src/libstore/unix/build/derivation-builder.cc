@@ -109,8 +109,8 @@ protected:
         Path source;
         bool optional;
         bool rdonly;
-        ChrootPath(Path source = "", bool optional = false, bool rdonly = false)
-            : source(source), optional(optional), rdonly(rdonly)
+        ChrootPath(Path source = "", bool optional = false, bool rdonly = false, std::string idmap = "")
+            : source(source), optional(optional), rdonly(rdonly), idmap(idmap)
         { }
     };
     typedef std::map<Path, ChrootPath> PathsInChroot; // maps target path to source path
@@ -848,23 +848,94 @@ DerivationBuilderImpl::PathsInChroot DerivationBuilderImpl::getPathsInSandbox()
 {
     PathsInChroot pathsInChroot;
 
-    auto addPathWithOptions = [&](std::string s) {
+    // Syntax: <target>[=<source>][:<lhs>=<rhs>[:...]][?]
+    // Backslash causes the next character to be interpreted literally.
+    // A "\\" is interpreted as a single "\".
+    auto addPathWithOptions = [&](const std::string & s) {
         if (s.empty()) return;
-        bool optional = false;
-        bool rdonly = false;
-        if (s[s.size() - 1] == '?') {
-            optional = true;
-            s.pop_back();
+
+        debug("Parsing sandbox path: '%s'", s);
+
+        std::string source, target;
+        bool optional = false, rdonly = false;
+        std::string idmap, tkn, lhs;
+
+        auto applyOpt = [&](const std::string & value) {
+            if (lhs == "ro") {
+                if (!value.empty())
+                    throw Error("sandbox path option 'ro' does not take a parameter");
+                rdonly = true;
+            } else if (lhs == "idmap") {
+                if (!idmap.empty()) idmap += ",";
+                idmap += value;
+            } else
+                throw Error("unrecognized sandbox path option: %s", lhs);
+            lhs = {};
+        };
+
+        enum class State { Target, Source, OptL, OptR, End };
+        State st = State::Target;
+
+        auto finalizeToken = [&](State next) {
+            switch (st) {
+                case State::Target:
+                    target = std::move(tkn);
+                    if (next != State::Source) // no separate =<source>
+                        source = target;
+                    break;
+                case State::Source:
+                    source = std::move(tkn);
+                    break;
+                case State::OptL:
+                    lhs = std::move(tkn);
+                    if (next != State::OptR)
+                        applyOpt("");
+                    break;
+                case State::OptR:
+                    applyOpt(tkn);
+                    break;
+                case State::End:
+                    return;
+            }
+            st = next;
+            tkn = {};
+        };
+
+        bool escape = false;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (escape) {
+                tkn += c;
+                escape = false;
+                continue;
+            }
+            if (st == State::End)
+                throw new Error("trailing characters in sandbox path: %s", s);
+            switch (c) {
+                case '\\': escape = true; break;
+                case ':': finalizeToken(State::OptL); break;
+                case '=':
+                    if      (st == State::Target) finalizeToken(State::Source);
+                    else if (st == State::OptL)   finalizeToken(State::OptR);
+                    else tkn += c;
+                    break;
+                case '?':
+                    if (i == s.size() - 1) {
+                        optional = true;
+                        finalizeToken(State::End);
+                    } else tkn += c;
+                    break;
+                default:
+                    tkn += c;
+                    break;
+            }
         }
-        if (s.size() > 3 && s.substr(s.size() - 3) == ":ro") {
-            rdonly = true;
-            s.resize(s.size() - 3);
-        }
-        size_t p = s.find('=');
-        if (p == std::string::npos)
-            pathsInChroot[s] = {s, optional, rdonly};
-        else
-            pathsInChroot[s.substr(0, p)] = {s.substr(p + 1), optional, rdonly};
+
+        finalizeToken(State::End);
+
+        debug("Parsed sandbox path: '%s' -> '%s' [optional=%d ro=%d idmap=%s]",
+                source, target, optional, rdonly, idmap);
+        pathsInChroot[target] = {source, optional, rdonly, idmap};
     };
 
     /* Allow a user-configurable set of directories from the
