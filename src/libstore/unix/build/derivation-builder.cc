@@ -109,6 +109,7 @@ protected:
         Path source;
         bool optional;
         bool rdonly;
+        std::string idmap;
         ChrootPath(Path source = "", bool optional = false, bool rdonly = false, std::string idmap = "")
             : source(source), optional(optional), rdonly(rdonly), idmap(idmap)
         { }

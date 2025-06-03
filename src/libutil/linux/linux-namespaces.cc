@@ -15,6 +15,28 @@
 
 namespace nix {
 
+/*
+ * Syscall wrappers for new mount features in Linux 5.2+.
+ */
+static inline int open_tree(int dfd, const char * path, unsigned int flags = 0)
+{
+    return syscall(SYS_open_tree, dfd, path, flags);
+}
+
+/*static inline int mount_setattr(int dfd, const char * path, unsigned int flags = 0,
+        struct mount_attr * uattr = nullptr,
+        size_t usize = sizeof(struct mount_attr))
+{
+    struct mount_attr def_attr = uattr ? *uattr : mount_attr{};
+    return syscall(SYS_mount_setattr, dfd, path, flags, &def_attr, usize);
+} A very recent glibc contains a wrapper! */
+
+static inline int move_mount(int dfd_from, const char * path_from,
+        int dfd_to, const char * path_to, unsigned int flags = 0)
+{
+    return syscall(SYS_move_mount, dfd_from, path_from, dfd_to, path_to, flags);
+}
+
 bool userNamespacesSupported()
 {
     static auto res = [&]() -> bool
@@ -161,7 +183,7 @@ IDMapping parseIDMapping(const std::string & str)
     switch (str[0]) {
         case 'g': mapping.type = IDMapType::GID; break;
         case 'u': mapping.type = IDMapType::UID; break;
-        default: throw Error("Unknown ID mapping type: " + str[0]);
+        default: throw Error("Unknown ID mapping type: %s", str[0]);
     };
 
     mapping.mapped_id = std::stoi(parts[0]);
@@ -180,14 +202,14 @@ void writeIDMapFile(const std::string & filepath, const std::vector<IDMapping> &
             oss << mapping.to_map_line();
             ++entries;
         }
-    if (entries > MAX_IDMAP_LINES)
-        throw Error("Too many mappings (>%d)", MAX_IDMAP_LINES);
+    if (entries > IDMAP_LIMIT)
+        throw Error("Too many mappings (>%d)", IDMAP_MAX_SIZE);
 
     /* TODO does there need to be defaults?
     if (entries == 0) oss << "100000 0 65534"; */
 
     std::string content = oss.str();
-    if (content.size() > MAX_IDMAP_LEN)
+    if (content.size() > IDMAP_LIMIT)
         throw Error("Size of ID map exceeds the 4K length limit for '%s'", filepath);
 
     std::ofstream file(filepath);
@@ -236,13 +258,13 @@ int createUsernamespaceWithMappings(const std::string & str)
     if (readLine(syncPipe.readSide.get(), true) != "1")
         throw Error("Unexpected response from child process");
 
-    writeFile(fmt("/proc/%d/setgroups", (pid_t)pid), "deny");
-    writeIDMapFile(fmt("/proc/%d/uid_map", (pid_t)pid), mappings, IDMapType::UID);
-    writeIDMapFile(fmt("/proc/%d/gid_map", (pid_t)pid), mappings, IDMapType::GID);
+    writeFile("/proc/" + std::to_string(pid) + "/setgroups", "deny");
+    writeIDMapFile("/proc/" + std::to_string(pid) + "/uid_map", mappings, IDMapType::UID);
+    writeIDMapFile("/proc/" + std::to_string(pid) + "/gid_map", mappings, IDMapType::GID);
 
     debug("Wrote ID maps, opening USER ns of PID=%d", (pid_t)pid);
 
-    int userFd = open(fmt("/proc/%d/ns/user", (pid_t)pid), O_RDONLY | O_NOCTTY);
+    int userFd = open(("/proc/" + std::to_string(pid) + "/ns/user").c_str(), O_RDONLY | O_NOCTTY);
     if (userFd < 0)
         throw SysError("open(userFd)");
     debug("ID map USER namespace Fd=%d", userFd);
@@ -291,26 +313,5 @@ void bindMountWithIDMap(const Path & source, const Path & target,
         throw SysError("move_mount: '%s'", source);
 
     close(treefd);
-}
-
-/*
- * Syscall wrappers for new mount features in Linux 5.2+.
- */
-static inline int open_tree(int dfd, char * path, unsigned int flags = 0)
-{
-    return syscall(SYS_open_tree, dfd, path, flags);
-}
-
-static inline int mount_setattr(int dfd, char * path, unsigned int flags = 0,
-        struct mount_attr * uattr = &(struct mount_attr){},
-        size_t usize = sizeof(struct mount_attr))
-{
-    return syscall(SYS_mount_setattr, dfd, path, flags, uattr, usize);
-}
-
-static inline int move_mount(int dfd_from, const char * path_from,
-        int dfd_to, const char * path_to, unsigned int flags = 0)
-{
-    return syscall(SYS_move_mount, dfd_from, path_from, dfd_to, path_to, flags);
 }
 }
