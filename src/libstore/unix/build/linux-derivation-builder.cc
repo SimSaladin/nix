@@ -252,7 +252,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         struct group * gr = nullptr;
         long bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
         if (bufsize == -1) bufsize = 16384;
-        std::vector<char> buffer(bufsize);
+        std::vector<char> buffer;
 
         for (const auto & group_entry : settings.supplementaryGroups.get()) {
             std::string group_name = group_entry;
@@ -270,9 +270,17 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 }
             }
 
-            int ret = getgrnam_r(group_name.c_str(), &grp, buffer.data(), buffer.size(), &gr);
-            if (ret != 0)
-                throw Error("getgrnam_r failed for group '%s': %s", group_name, strerror(ret));
+            while (true) {
+                buffer.resize(bufsize);
+                int ret = getgrnam_r(group_name.c_str(), &grp, buffer.data(), buffer.size(), &gr);
+                if (ret == 0) {
+                    break;
+                } else if (ret == ERANGE) { // buffer too small
+                    bufsize *= 2;
+                } else if (ret != 0)
+                    throw Error("getgrnam_r failed for group '%s': %s", group_name, strerror(ret));
+            }
+
             if (!gr) {
                 debug("Supplementary group '%s' not found", group_name);
                 continue;
