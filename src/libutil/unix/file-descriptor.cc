@@ -222,7 +222,7 @@ void unix::closeOnExec(int fd)
 }
 
 #if defined(__linux__)
-static inline int unix::pidfd_open(pid_t pid, unsigned int flags)
+int unix::pidfd_open(pid_t pid, unsigned int flags)
 {
     return syscall(SYS_pidfd_open, pid, flags);
 }
