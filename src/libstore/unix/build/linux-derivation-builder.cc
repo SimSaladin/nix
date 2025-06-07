@@ -829,8 +829,11 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 chmod_(dst, 0555);
             } else
 #  endif
-            {
-                doBind(i.second.source, chrootRootDir + i.first, i.second.optional);
+            if (i.second.idmap == "")
+                doBind(i.second.source, chrootRootDir + i.first, i.second.optional, i.second.rdonly);
+
+            else {
+                writeLine(builderSync.writeSide.get(), fmt("M %s", i.first));
             }
         }
 
