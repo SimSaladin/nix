@@ -199,6 +199,11 @@ void closeExtraFDs();
  */
 void closeOnExec(Descriptor fd);
 
+/**
+ * Open PID file descriptor.
+ */
+static inline int pidfd_open(pid_t pid, unsigned int flags);
+
 } // namespace unix
 #endif
 
