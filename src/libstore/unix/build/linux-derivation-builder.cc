@@ -3,6 +3,7 @@
 #  include "nix/store/personality.hh"
 #  include "nix/util/cgroup.hh"
 #  include "nix/util/linux-namespaces.hh"
+#  include "nix/util/idmaps.hh"
 #  include "linux/fchmodat2-compat.hh"
 
 #  include <sys/ioctl.h>
