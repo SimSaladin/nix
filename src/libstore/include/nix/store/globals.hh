@@ -71,10 +71,12 @@ public:
 
     std::vector<MountOpt> options;
 
+    std::string idmap;
+
     SandboxPath(std::string source = "", bool optional = false,
-        bool readOnly = false, std::vector<MountOpt> options = { }) :
+        bool readOnly = false, std::vector<MountOpt> options = { }, std::string idmap = "") :
         source(std::string(std::move(source))), optional(optional),
-        readOnly(readOnly), options(std::move(options)) { }
+        readOnly(readOnly), options(std::move(options)), idmap(std::move(idmap)) { }
 
     /* This is to enable the full implicit conversion from e.g. const char[],
      * even when binding a reference. Code can specify paths with literals and

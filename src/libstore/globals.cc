@@ -312,7 +312,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SandboxPath::MountOpt, {
 #endif
 });
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SandboxPath, source, optional, readOnly, options);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SandboxPath, source, optional, readOnly, options, idmap);
 
 /**
  * Parses either old ("path[=source][?]" strings) or new (json object) format
@@ -370,6 +370,7 @@ template<> std::string BaseSetting<SandboxPaths>::to_string() const
         if (v.optional) po.emplace("optional", v.optional);
         if (v.readOnly) po.emplace("readOnly", v.readOnly);
         if (!v.options.empty()) po.emplace("options", v.options);
+        if (v.idmap != "") po.emplace("idmap", v.idmap);
         res.emplace(k, std::move(po));
     }
     return res.dump();
