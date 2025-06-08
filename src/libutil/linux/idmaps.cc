@@ -282,8 +282,14 @@ void bindMountWithIDMap(const Path & source, const Path & target, int userns_fd,
         if (optional) return;
         else throw SysError("stat path '%s'", source);
     }
-    // TODO do we need to handle source is file/symlink differently?
-    createDirs(target);
+
+    // Ensure that parent of target path is a directory
+    createDirs(dirOf(target));
+
+    // For a directory, ensure the whole path is a directory. Otherwise ensure
+    // it's a file.
+    if (S_ISDIR(maybeSt->st_mode)) createDirs(target);
+    else writeFile(target, "");
 
     AutoCloseFD tfd = open_tree(-EBADF, source.c_str(), open_tree_flags);
 
@@ -396,6 +402,8 @@ std::vector<gid_t> UserMountNSHelper::getSupplementarySetGroups()
 {
     auto st(state_.lock());
     std::vector<gid_t> ret;
+    if (!st->useSupplementaryGroups)
+        return ret;
     for (auto & [pgid, cgid] : st->supplementaryGIDs)
         ret.push_back(pgid);
     return ret;
@@ -469,6 +477,8 @@ void UserMountNSHelper::createUsersPasswdContent(const Path & out, const Path & 
 void UserMountNSHelper::setupSupplementaryGroups(const StringSet supgrps)
 {
     auto st(state_.lock());
+    if (!st->useSupplementaryGroups)
+        return;
     std::vector<gid_t> reserved_gids = {st->builderPrimaryUID.mapped_id, 0, 65534};
     std::vector<std::string> reserved_names = {"root", "nixbld", "nogroup"};
 

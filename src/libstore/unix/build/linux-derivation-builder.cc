@@ -122,6 +122,8 @@ static void setupSeccomp()
 #  endif
 }
 
+    // NOSYMFOLLOW was introduced in Linux 5.10. Not sure when it would be
+    // useful...
 static void doBind(const Path & source, const Path & target, bool optional = false, bool rdonly = false)
 {
     debug("bind mounting '%1%' to '%2%'", source, target);
@@ -153,8 +155,12 @@ static void doBind(const Path & source, const Path & target, bool optional = fal
         createDirs(target);
         bindMount();
     } else if (S_ISLNK(st.st_mode)) {
-        // A symlink may not be bind-mounted on top of a directory, but can be
-        // bind-mounted over a _file_ or _symlink_. (What about non-regular files?)
+        // The old mount(2) syscall does not seem capable of handling
+        // symlinks, so redirect to the new mount fd API instead (if it is
+        // available).
+        // But first check the target path. A symlink may not be bind-mounted
+        // on top of a directory, but can be bind-mounted over a _file_ or
+        // _symlink_. (What about non-regular files?)
         auto targetStat = maybeLstat(target);
         if (!targetStat) {
             createDirs(dirOf(target));
@@ -162,7 +168,7 @@ static void doBind(const Path & source, const Path & target, bool optional = fal
         } else if (S_ISDIR(targetStat->st_mode) && !optional) {
             throw SysError("unable to mount '%1%' on '%2%': a symlink may not be bind-mounted over a directory!", source, target);
         }
-        bindMount();
+        bindMountWithIDMap(source, target, -1, optional, rdonly);
     } else {
         createDirs(dirOf(target));
         writeFile(target, "");

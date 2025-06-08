@@ -91,6 +91,10 @@ public:
          */
         IDMapping builderPrimaryUID, builderPrimaryGID;
 
+        /**
+         * Whether supplementary groups are to be used. If false we try to
+         * drop any existing groups instead.
+         */
         bool useSupplementaryGroups = false;
 
         /**
@@ -129,8 +133,7 @@ public:
     };
 
     Sync<NS_State> state_;
-    UserMountNSHelper() = default;
-    ~UserMountNSHelper();
+
     void update(std::function<void(NS_State &)>);
 
     /**
