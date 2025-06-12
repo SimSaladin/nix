@@ -368,6 +368,13 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         if (buildUser && chown(chrootStoreDir.c_str(), 0, buildUser->getGID()) == -1)
             throw SysError("cannot change ownership of '%1%'", chrootStoreDir);
 
+        pathsInChroot = getPathsInSandbox();
+
+        for (auto & i : inputPaths) {
+            auto p = store.printStorePath(i);
+            pathsInChroot.insert_or_assign(p, store.toRealPath(p));
+        }
+
         /* If we're repairing, checking or rebuilding part of a
            multiple-outputs derivation, it's possible that we're
            rebuilding a path that is in settings.sandbox-paths
@@ -392,12 +399,19 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             // chownToBuilder(*cgroup + "/cgroup.subtree_control");
         }
 
-        pathsInChroot = getPathsInSandbox();
-
-        for (auto & i : inputPaths) {
-            auto p = store.printStorePath(i);
-            pathsInChroot.insert_or_assign(p, store.toRealPath(p));
-        }
+        // Chroot paths that specify id-maps need to be mounted differently
+        // than  others.
+        std::map<Path, IDMappedChrootPath> result;
+        for (auto & i : pathsInChroot)
+            if (!i.second.idmap.empty())
+                result[i.first] =
+                {
+                    .source   = i.second.source,
+                    .optional = i.second.optional,
+                    .rdonly   = i.second.rdonly,
+                    .idmap    = parseIDMappingsList(i.second.idmap),
+                };
+        userMountNSHelper.addChrootPathsWithIDMap(result);
     }
 
     Strings getPreBuildHookArgs() override
