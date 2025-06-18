@@ -301,6 +301,7 @@ namespace nix {
 
     TEST_F(PrimOpTest, elemtAtOutOfBounds) {
         ASSERT_THROW(eval("builtins.elemAt [0 1 2 3] 5"), Error);
+        ASSERT_THROW(eval("builtins.elemAt [0] 4294967296"), Error);
     }
 
     TEST_F(PrimOpTest, head) {
@@ -592,6 +593,16 @@ namespace nix {
         ASSERT_THAT(v, IsStringEq("n"));
     }
 
+    TEST_F(PrimOpTest, substringHugeStart){
+        auto v = eval("builtins.substring 4294967296 5 \"nixos\"");
+        ASSERT_THAT(v, IsStringEq(""));
+    }
+
+    TEST_F(PrimOpTest, substringHugeLength){
+        auto v = eval("builtins.substring 0 4294967296 \"nixos\"");
+        ASSERT_THAT(v, IsStringEq("nixos"));
+    }
+
     TEST_F(PrimOpTest, substringEmptyString){
         auto v = eval("builtins.substring 1 3 \"\"");
         ASSERT_THAT(v, IsStringEq(""));
@@ -656,8 +667,8 @@ namespace nix {
         auto v = eval("derivation");
         ASSERT_EQ(v.type(), nFunction);
         ASSERT_TRUE(v.isLambda());
-        ASSERT_NE(v.payload.lambda.fun, nullptr);
-        ASSERT_TRUE(v.payload.lambda.fun->hasFormals());
+        ASSERT_NE(v.lambda().fun, nullptr);
+        ASSERT_TRUE(v.lambda().fun->hasFormals());
     }
 
     TEST_F(PrimOpTest, currentTime) {

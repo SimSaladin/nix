@@ -122,32 +122,44 @@ static void setupSeccomp()
 #  endif
 }
 
-    // NOSYMFOLLOW was introduced in Linux 5.10. Not sure when it would be
-    // useful...
-static void doBind(const Path & source, const Path & target, bool optional = false, bool rdonly = false)
+static uint64_t mergeIntoMountOpts(uint64_t oset, uint64_t o) {
+    for (const auto & [mask, _] : SandboxPath::exclusiveOptionMasks)
+        if (o & mask) return (oset & ~mask) | o;
+    return oset | o;
+};
+
+template<typename Iterable>
+static uint64_t combineMountOpts(uint64_t init, const Iterable& opts)
 {
-    debug("bind mounting '%1%' to '%2%'", source, target);
+    return std::transform_reduce(std::begin(opts), std::end(opts), init, mergeIntoMountOpts,
+        [](const SandboxPath::MountOpt & o) { return static_cast<uint64_t>(o); });
+};
+
+static void doBind(const SandboxPath & v, const Path & target)
+{
+    debug("bind mounting '%1%' to '%2%'", v.source, target);
 
     auto bindMount = [&]() {
-        if (mount(source.c_str(), target.c_str(), "", MS_BIND | MS_REC, 0) == -1)
-            throw SysError("bind mount from '%1%' to '%2%' failed", source, target);
-        if (rdonly) {
-            // These flags can all be set on a per-mount-point basis. If
-            // RDONLY is requested we enable all of these.
-            // Rarely would one not want these too if one wants RDONLY.
-            static constexpr unsigned int flags = MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV;
+        if (mount(v.source.c_str(), target.c_str(), "", MS_BIND | MS_REC, 0) == -1)
+            throw SysError("bind mount from '%1%' to '%2%' failed", v.source, target);
+
+        // set extra options when wanted
+        auto flags = v.readOnly ? combineMountOpts(0, SandboxPath::readOnlyDefaults) : 0;
+        flags = combineMountOpts(flags, v.options);
+        if (flags != 0) {
             // initial mount wouldn't respect MS_RDONLY, must remount
+            debug("remounting '%s' with flags: %d", target, flags);
             if (mount("", target.c_str(), "", MS_REMOUNT | MS_BIND | flags, 0) == -1)
-                throw (SysError("making bind mount '%s' read-only failed", target));
+                throw SysError("mount: updating bind-mount flags of '%s' failed", target);
         }
     };
 
-    auto maybeSt = maybeLstat(source);
+    auto maybeSt = maybeLstat(v.source);
     if (!maybeSt) {
-        if (optional)
+        if (v.optional)
             return;
         else
-            throw SysError("getting attributes of path '%1%'", source);
+            throw SysError("getting attributes of path '%1%'", v.source);
     }
     auto st = *maybeSt;
 
@@ -155,20 +167,23 @@ static void doBind(const Path & source, const Path & target, bool optional = fal
         createDirs(target);
         bindMount();
     } else if (S_ISLNK(st.st_mode)) {
-        // The old mount(2) syscall does not seem capable of handling
-        // symlinks, so redirect to the new mount fd API instead (if it is
-        // available).
-        // But first check the target path. A symlink may not be bind-mounted
-        // on top of a directory, but can be bind-mounted over a _file_ or
-        // _symlink_. (What about non-regular files?)
-        auto targetStat = maybeLstat(target);
-        if (!targetStat) {
-            createDirs(dirOf(target));
-            writeFile(std::filesystem::path(target), "");
-        } else if (S_ISDIR(targetStat->st_mode) && !optional) {
-            throw SysError("unable to mount '%1%' on '%2%': a symlink may not be bind-mounted over a directory!", source, target);
-        }
-        bindMountWithIDMap(source, target, -1, optional, rdonly);
+        // // The old mount(2) syscall does not seem capable of handling
+        // // symlinks, so redirect to the new mount fd API instead (if it is
+        // // available).
+        // // But first check the target path. A symlink may not be bind-mounted
+        // // on top of a directory, but can be bind-mounted over a _file_ or
+        // // _symlink_. (What about non-regular files?)
+        // auto targetStat = maybeLstat(target);
+        // if (!targetStat) {
+        //     createDirs(dirOf(target));
+        //     writeFile(std::filesystem::path(target), "");
+        // } else if (S_ISDIR(targetStat->st_mode) && !optional) {
+        //     throw SysError("unable to mount '%1%' on '%2%': a symlink may not be bind-mounted over a directory!", source, target);
+        // }
+        // bindMountWithIDMap(source, target, -1, optional, rdonly);
+        // Symlinks can (apparently) not be bind-mounted, so just copy it
+        createDirs(dirOf(target));
+        copyFile(std::filesystem::path(v.source), std::filesystem::path(target), false);
     } else {
         createDirs(dirOf(target));
         writeFile(target, "");
@@ -341,7 +356,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         printMsg(lvlChatty, "setting up chroot environment in '%1%'", chrootParentDir);
 
         if (mkdir(chrootParentDir.c_str(), 0700) == -1)
-            throw SysError("cannot create '%s'", chrootRootDir);
+            throw SysError("cannot create '%s'", chrootParentDir);
 
         chrootRootDir = chrootParentDir + "/root";
 
@@ -775,7 +790,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             // For backwards-compatibility, resolve all the symlinks in the
             // chroot paths.
             auto canonicalPath = canonPath(i, true);
-            pathsInChroot.emplace(i, canonicalPath);
+            pathsInChroot.try_emplace(i, canonicalPath);
         }
 
         /* Bind-mount all the directories from the "host"
@@ -797,7 +812,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             } else
 #  endif
             if (i.second.idmap == "")
-                doBind(i.second.source, chrootRootDir + i.first, i.second.optional, i.second.rdonly);
+                doBind(i.second, chrootRootDir + i.first);
             else {
                /** In order to do ID-mapping mounts without much restrictions
                 * from kernel we make the parent do all the work from its

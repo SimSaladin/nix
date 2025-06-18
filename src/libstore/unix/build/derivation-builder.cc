@@ -105,16 +105,8 @@ protected:
     /**
      * Stuff we need to pass to initChild().
      */
-    struct ChrootPath {
-        Path source;
-        bool optional;
-        bool rdonly;
-        std::string idmap;
-        ChrootPath(Path source = "", bool optional = false, bool rdonly = false, std::string idmap = "")
-            : source(source), optional(optional), rdonly(rdonly), idmap(idmap)
-        { }
-    };
-    typedef std::map<Path, ChrootPath> PathsInChroot; // maps target path to source path
+
+    typedef SandboxPaths PathsInChroot;
 
     typedef StringMap Environment;
     Environment env;
@@ -591,10 +583,10 @@ static void replaceValidPath(const Path & storePath, const Path & tmpPath)
        way first.  We'd better not be interrupted here, because if
        we're repairing (say) Glibc, we end up with a broken system. */
     Path oldPath;
-    
+
     if (pathExists(storePath)) {
         // why do we loop here?
-        // although makeTempPath should be unique, we can't 
+        // although makeTempPath should be unique, we can't
         // guarantee that.
         do {
             oldPath = makeTempPath(storePath, ".old");
@@ -849,106 +841,16 @@ DerivationBuilderImpl::PathsInChroot DerivationBuilderImpl::getPathsInSandbox()
 {
     PathsInChroot pathsInChroot;
 
-    // Syntax: <target>[=<source>][:<lhs>=<rhs>[:...]][?]
-    // Backslash causes the next character to be interpreted literally.
-    // A "\\" is interpreted as a single "\".
-    auto addPathWithOptions = [&](const std::string & s) {
-        if (s.empty()) return;
-
-        debug("Parsing sandbox path: '%s'", s);
-
-        std::string source, target;
-        bool optional = false, rdonly = false;
-        std::string idmap, tkn, lhs;
-
-        auto applyOpt = [&](const std::string & value) {
-            if (lhs == "ro") {
-                if (!value.empty())
-                    throw Error("sandbox path option 'ro' does not take a parameter");
-                rdonly = true;
-            } else if (lhs == "idmap") {
-                if (!idmap.empty()) idmap += ",";
-                idmap += value;
-            } else
-                throw Error("unrecognized sandbox path option: %s", lhs);
-            lhs = {};
-        };
-
-        enum class State { Target, Source, OptL, OptR, End };
-        State st = State::Target;
-
-        auto finalizeToken = [&](State next) {
-            switch (st) {
-                case State::Target:
-                    target = std::move(tkn);
-                    if (next != State::Source) // no separate =<source>
-                        source = target;
-                    break;
-                case State::Source:
-                    source = std::move(tkn);
-                    break;
-                case State::OptL:
-                    lhs = std::move(tkn);
-                    if (next != State::OptR)
-                        applyOpt("");
-                    break;
-                case State::OptR:
-                    applyOpt(tkn);
-                    break;
-                case State::End:
-                    return;
-            }
-            st = next;
-            tkn = {};
-        };
-
-        bool escape = false;
-        for (size_t i = 0; i < s.size(); ++i) {
-            char c = s[i];
-            if (escape) {
-                tkn += c;
-                escape = false;
-                continue;
-            }
-            if (st == State::End)
-                throw new Error("trailing characters in sandbox path: %s", s);
-            switch (c) {
-                case '\\': escape = true; break;
-                case ':': finalizeToken(State::OptL); break;
-                case '=':
-                    if      (st == State::Target) finalizeToken(State::Source);
-                    else if (st == State::OptL)   finalizeToken(State::OptR);
-                    else tkn += c;
-                    break;
-                case '?':
-                    if (i == s.size() - 1) {
-                        optional = true;
-                        finalizeToken(State::End);
-                    } else tkn += c;
-                    break;
-                default:
-                    tkn += c;
-                    break;
-            }
-        }
-
-        finalizeToken(State::End);
-
-        debug("Parsed sandbox path: '%s' -> '%s' [optional=%d ro=%d idmap=%s]",
-                source, target, optional, rdonly, idmap);
-        pathsInChroot[target] = {source, optional, rdonly, idmap};
-    };
-
     /* Allow a user-configurable set of directories from the
        host file system. */
-    for (auto i : settings.sandboxPaths.get()) {
-        addPathWithOptions(i);
-    }
+    for (const auto & [k, v] : settings.sandboxPaths.get())
+        pathsInChroot.insert_or_assign(k, v);
+
     if (hasPrefix(store.storeDir, tmpDirInSandbox()))
     {
         throw Error("`sandbox-build-dir` must not contain the storeDir");
     }
-    pathsInChroot[tmpDirInSandbox()] = tmpDir;
+    pathsInChroot.insert_or_assign(tmpDirInSandbox(), tmpDir);
 
     /* Add the closure of store paths to the chroot. */
     StorePathSet closure;
@@ -1018,7 +920,8 @@ DerivationBuilderImpl::PathsInChroot DerivationBuilderImpl::getPathsInSandbox()
                 if (line == "") {
                     state = stBegin;
                 } else {
-                    addPathWithOptions(line);
+                    for (const auto & [k, v] : SandboxPath::parse(line, "extra-sandbox-paths (via pre-build-hook)"))
+                        pathsInChroot.try_emplace(k, v);
                 }
             }
         }
@@ -1949,7 +1852,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
            also a source for non-determinism. */
         if (delayedException)
             std::rethrow_exception(delayedException);
-        return miscMethods->assertPathValidity();
+        return {};
     }
 
     /* Apply output checks. */
