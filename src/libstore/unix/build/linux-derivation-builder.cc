@@ -238,9 +238,9 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
     PathsInChroot pathsInChroot;
 
     /**
-     * ID-map handling for bind-mounts that utilize it.
+     * UID and GID mappings.
      */
-    UserMountNSHelper userMountNSHelper;
+    SandboxIDMap sandboxIDMap;
 
     /**
      * The cgroup of the builder, if any.
@@ -386,23 +386,21 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         if (drvOptions.useUidRange(drv) && (!buildUser || buildUser->getUIDCount() < 65536))
             throw Error("feature 'uid-range' requires the setting '%s' to be enabled", settings.autoAllocateUids.name);
 
-        /* Copy params we know at this point to the utility class FIXME maybe
-           just refer to this object and avoid duplicating so much? */
-        userMountNSHelper.update([&](auto & st){
-            st.chrootRootDir = chrootRootDir;
-            /* Attempt to set supplementary groups only if auto-allocate-uids
-               and we are running privileged. (Otherwise setgroups will
-               definitely not work.) */
-            st.useSupplementaryGroups = settings.autoAllocateUids && getuid() == 0;
-            st.builderPrimaryUID = {IDMapType::UID, sandboxUid(), 0, 1}; // TODO do we know host ids here yet?
-            st.builderPrimaryGID = {IDMapType::GID, sandboxGid(), 0, 1};
-        });
+        // TODO do we know host ids here yet?
+        sandboxIDMap.setPrimaryIDs(sandboxUid(), sandboxGid(),
+                buildUser ? buildUser->getUID() : getuid(),
+                buildUser ? buildUser->getGID() : getgid(),
+                buildUser->getUIDCount());
 
-        userMountNSHelper.setupSupplementaryGroups(settings.supplementaryGroups.get());
+        /* Attempt to set supplementary groups only if auto-allocate-uids
+           and we are running privileged. (Otherwise setgroups will
+           definitely not work.) */
+        if (settings.autoAllocateUids && getuid() == 0)
+            sandboxIDMap.addSupplementaryGroups(settings.supplementaryGroups.get());
 
         /* Declare the build user's group so that programs get a consistent
            view of the system (e.g., "id -gn"). */
-        userMountNSHelper.createGroupsContent(chrootRootDir + "/etc/group");
+        sandboxIDMap.write_etc_groups(chrootRootDir + "/etc/group");
 
         /* Create /etc/hosts with localhost entry. */
         if (derivationType.isSandboxed())
@@ -454,18 +452,10 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         }
 
         // Chroot paths that specify id-maps need to be mounted differently
-        // than  others.
-        std::map<Path, IDMappedChrootPath> result;
+        // than  others...
         for (auto & i : pathsInChroot)
             if (!i.second.idmap.empty())
-                result[i.first] =
-                {
-                    .source   = i.second.source,
-                    .optional = i.second.optional,
-                    .rdonly   = i.second.readOnly,
-                    .idmap    = parseIDMappingsList(i.second.idmap),
-                };
-        userMountNSHelper.addChrootPathsWithIDMap(result);
+                sandboxIDMap.recordMountIDMap(IDMap::parse_maps(i.second.idmap));
     }
 
     Strings getPreBuildHookArgs() override
@@ -520,7 +510,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         sandboxControl.create();
 
         usingUserNamespace = userNamespacesSupported();
-        std::vector<gid_t> supplementaryGroups = userMountNSHelper.getSupplementarySetGroups();
+        std::vector<gid_t> supplementaryGroups = sandboxIDMap.supplementaryHostGIDs();
 
         Pid helper = startProcess([&]() {
             sandboxControl.readSide.close();
@@ -591,11 +581,18 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                     char head = ln[0];
                     auto tail = ln.substr(1);
                     switch (head) {
-                        case 'M':
+                        case 'M': {
                             debug("Mount request: %s", tail);
-                            userMountNSHelper.setupSandboxPathHandlerSide(tail);
+                            auto cp = pathsInChroot.at(tail);
+                            sandboxIDMap.add_sandbox_path_handler_side(tail, IDMappedChrootPath({
+                                    .source = cp.source,
+                                    .optional = cp.optional,
+                                    .readOnly = cp.readOnly,
+                                    .idmap = IDMap::parse_maps(cp.idmap),
+                                }), chrootRootDir, sandboxMountNamespace.get());
                             writeResponse("m");
                             break;
+                                  }
                         case '2':
                             writeResponse("2");
                             throw EndOfFile("stream-ended");
@@ -618,20 +615,12 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             /* Set the UID/GID mapping of the builder's user namespace
                such that the sandbox user maps to the build user, or to
                the calling user (if build users are disabled). */
-            uid_t hostUid = buildUser ? buildUser->getUID() : getuid();
-            uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
-            uid_t nrIds = buildUser ? buildUser->getUIDCount() : 1;
-
-            /* Update previously added entries with the assigned real IDs. */
-            userMountNSHelper.update([&](auto & st) {
-                st.builderPrimaryUID.host_id = hostUid;
-                st.builderPrimaryGID.host_id = hostGid;
-                st.builderPrimaryUID.range = nrIds;
-                st.builderPrimaryGID.range = nrIds;
-            });
+            //uid_t hostUid = buildUser ? buildUser->getUID() : getuid();
+            //uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
+            //uid_t nrIds = buildUser ? buildUser->getUIDCount() : 1;
 
             // Writes setgroups, uid_map and gid_map
-            userMountNSHelper.writeProcessIDMapFiles(pid);
+            sandboxIDMap.write_userns_map(pid);
         } else {
             debug("note: not using a user namespace");
             if (!buildUser)
@@ -641,7 +630,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 
         /* Now that we now the sandbox uid, we can write
            /etc/passwd. */
-        userMountNSHelper.createUsersPasswdContent(chrootRootDir + "/etc/passwd", settings.sandboxBuildDir);
+        sandboxIDMap.write_etc_passwd(chrootRootDir + "/etc/passwd", settings.sandboxBuildDir);
 
         /* Save the mount- and user namespace of the child. We have to do this
          *before* the child does a chroot. */
@@ -654,9 +643,6 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             if (sandboxUserNamespace.get() == -1)
                 throw SysError("getting sandbox user namespace");
         }
-
-        // Record the sandbox mount namespace for ID-mapped bind-mounts use
-        userMountNSHelper.update([&](auto & st) { st.mountNsFd = sandboxMountNamespace.get(); });
 
         /* Move the child into its own cgroup. */
         if (cgroup)

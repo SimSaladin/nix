@@ -5,49 +5,84 @@
 
 namespace nix {
 
-/* kernel only takes up to 4k in size or 340 in number of entries written
- * into uid_map/gid_map */
-static inline constexpr size_t IDMAP_MAX_SIZE = 4096;
-static inline constexpr uint64_t IDMAP_LIMIT = 340;
-
-enum class IDMapType : char { UID = 'u', GID = 'g' };
-std::ostream & operator<<(std::ostream & os, const IDMapType & t);
+/**
+ * Makes an ID-mapping bind mount.
+ *
+ * mount(2) does not support ID mapping. We need to use the new
+ * mount_setattr(2) syscall API and also open_tree() and move_mount().
+ * None of those have wrappers, yet.
+ **/
+// XXX take SandboxPath instead
+void bindMountWithIDMap(
+    const Path & source,
+    const Path & target,
+    int userns_fd = -1,
+    bool optional = false,
+    bool readOnly = false);
 
 struct IDMapping
 {
-    IDMapType type;
+    enum class Type : char {
+        User = 'u',
+        Group = 'g',
+        Both = 'b',
+    };
+
+    Type type;
     id_t mapped_id = UNSET, host_id = UNSET;
     unsigned int range = 1;
 
     // 0 is as valid ID as any but not the safest default
-    static constexpr id_t UNSET = static_cast<id_t>(-1);
-    static constexpr char TypeSep = '=';
-    static constexpr char ValueSep[] = "-";
+    static inline constexpr id_t UNSET = static_cast<id_t>(-1);
+    static inline constexpr char TypeSep = '=';
+    static inline constexpr char ValueSep[] = "-";
+
+    /* kernel only takes up to 4k in size or 340 in number of entries written
+     * into uid_map/gid_map */
+    static inline constexpr size_t IDMAP_MAX_SIZE = 4096;
+    static inline constexpr uint64_t IDMAP_LIMIT = 340;
 
     std::string to_map_line() const;
     bool operator<(const IDMapping & other) const;
     bool overlaps_with(const IDMapping & other) const;
-    friend std::ostream & operator<<(std::ostream & os, const IDMapping & m);
+    bool overlaps_with_any(auto maps) const;
+
+    friend std::ostream & operator<<(std::ostream&, const Type&);
+    friend std::ostream & operator<<(std::ostream&, const IDMapping&);
+
+    static Type parse_type(const char);
+    static IDMapping parse(const std::string&);
+
+    static bool contains(const Type, const Type);
+
+    bool contains(const Type) const;
 };
 
-typedef std::set<IDMapping> IDMappings;
-
-IDMappings parseIDMappingsList(const std::string & maps);
-
-class IDMapper
+class IDMap
 {
-    IDMappings explicit_maps, fallback_maps;
 public:
-    IDMapper() {};
-    IDMapper(const IDMappings & expl);
-    IDMapper(const std::string & expl);
+    typedef std::set<IDMapping> Set;
+private:
+    Set explicit_maps, fallback_maps;
+
+public:
+    IDMap(const Set& explicit_maps);
+    IDMap(const std::string & explicit_maps = "");
+
+    static Set parse_maps(const std::string&);
+
     void add_explicit(const IDMapping & map);
     void add_explicit(const std::string & map);
+
     void add_fallback(const IDMapping & map);
     void add_fallback(const std::string & map);
-    void transform(IDMapType type, id_t from, id_t to);
-    std::vector<IDMapping> collect(IDMapType type) const;
-    IDMappings collectBoth() const;
+
+    std::vector<IDMapping> collect(const IDMapping::Type type) const;
+    Set collectBoth() const;
+
+    void transform(const IDMapping::Type type, id_t from, id_t to);
+
+    int createUsernamespace() const;
 };
 
 /**
@@ -58,8 +93,8 @@ struct IDMappedChrootPath
 {
     Path source = "";
     bool optional = false;
-    bool rdonly = false;
-    IDMappings idmap = {};
+    bool readOnly = false;
+    IDMap::Set idmap = {};
     /* Mount-point flags:
      * - MS_NODEV
      * - MS_NOEXEC
@@ -69,6 +104,56 @@ struct IDMappedChrootPath
     unsigned int mpflags = 0;
     /* SHARED | PRIVATE | SLAVE UNBINDABLE */
     unsigned int propagation = MS_SLAVE;
+};
+
+class SandboxIDMap
+{
+private:
+    // builder user's primary UID and GID.
+    IDMapping primaryUID, primaryGID;
+
+    // Builder namespace ID maps.
+    IDMap primaryIDMap;
+
+    // Whether or not supplementary groups should be set. If false sup groups
+    // are emptied.
+    bool useSupplementaryGroups = false;
+
+    // Host GID -> Sandbox GID
+    std::map<gid_t, gid_t> supplementaryGIDs = {};
+
+    // group names inside sandbox
+    std::map<gid_t, std::string> groupNames = {
+        { 0, "root" },
+        { IDMapping::UNSET, "nixbld" }, // Substituted with primaryGID
+        { 65534, "nogroup" },
+    };
+
+    std::map<Path,IDMappedChrootPath> idmappedChrootPaths = {};
+
+    /**
+     * User namespace FDs for idmapped mounts. We store each unique map
+     * definition for re-use (creating an idmapping fd requires us to
+     * setup a whole new user namespace).
+     */
+    std::map<IDMap::Set, AutoCloseFD> userNamespaceFDs = {};
+public:
+
+    void setPrimaryIDs(uid_t uid, gid_t gid, uid_t, gid_t, id_t nrids = 1);
+
+    /** Format minimal /etc/groups for the sandbox */
+    void write_etc_groups(const Path &) const;
+    void write_etc_passwd(const Path & out, const Path & sandboxBuildDir) const;
+    void write_userns_map(pid_t pid) const;
+
+    /** Get the host-side GIDs that should be assigned with setgroups() */
+    std::vector<gid_t> supplementaryHostGIDs() const;
+
+    void addSupplementaryGroups(const StringSet);
+
+    void add_sandbox_path_handler_side(const Path &, const IDMappedChrootPath &, const Path &, int mountNsFd);
+
+    void recordMountIDMap(IDMap::Set map);
 };
 
 /**
@@ -90,6 +175,7 @@ public:
          * Note: ought to take precedence over any other preference set in
          * "idmap".
          */
+        // XXX moved
         IDMapping builderPrimaryUID, builderPrimaryGID;
 
         /**
@@ -113,19 +199,19 @@ public:
         /**
          * Sandbox default uid & gid maps
          */
-        IDMapper idmapper;
-
-        /**
-         * ID-mapped chroot paths. Keyed by the target path.
-         */
-        std::map<Path, IDMappedChrootPath> chrootPaths;
+        IDMap idmapper;
 
         /**
          * User namespace FDs for idmapped mounts. We store each unique map
          * definition for re-use (creating an idmapping fd requires us to
          * setup a whole new user namespace).
          */
-        std::map<IDMappings, AutoCloseFD> chrootPathNamespaceFds;
+        std::map<IDMap::Set, AutoCloseFD> userNamespaceFDs = {};
+
+        /**
+         * ID-mapped chroot paths. Keyed by the target path.
+         */
+        std::map<Path, IDMappedChrootPath> chrootPaths;
 
         /**
          * Chroot root directory outside the sandbox
@@ -135,7 +221,7 @@ public:
 
     Sync<NS_State> state_;
 
-    void update(std::function<void(NS_State &)>);
+    //void update(std::function<void(NS_State &)>);
 
     /**
      * Mount the specified sandbox path in the build sandbox.
@@ -143,53 +229,26 @@ public:
      */
     void setupSandboxPathHandlerSide(const Path & target);
 
+    void addChrootPathsWithIDMap(std::map<Path, IDMappedChrootPath>);
+
+    /** Format minimal /etc/passwd for the sandbox */
+    //void createUsersPasswdContent(const Path &, const Path &);
+
     /**
      * Interprets the supplementary-groups option from a config.
      */
-    void setupSupplementaryGroups(const StringSet);
+    //void setupSupplementaryGroups(const StringSet);
 
     /**
      * The groups that should be assigned via setgroups()
      */
-    std::vector<gid_t> getSupplementarySetGroups();
+    //std::vector<gid_t> getSupplementarySetGroups();
 
     /** Write setgroups, uid_map and gid_map from parent process for a child
      * (pid) */
-    void writeProcessIDMapFiles(pid_t);
-
-    void addChrootPathsWithIDMap(std::map<Path, IDMappedChrootPath>);
-
-    /** Format minimal /etc/passwd for the sandbox */
-    void createUsersPasswdContent(const Path &, const Path &);
+    //void writeProcessIDMapFiles(pid_t);
 
     /** Format minimal /etc/groups for the sandbox */
-    void createGroupsContent(const Path &);
+    //void createGroupsContent(const Path &);
 };
-
-/**
- * Makes an ID-mapping bind mount.
- *
- * mount(2) does not support ID mapping. We need to use the new
- * mount_setattr(2) syscall API and also open_tree() and move_mount().
- * None of those have wrappers, yet.
- **/
-void bindMountWithIDMap(
-    const Path & source, const Path & target, int userns_fd = -1, bool optional = false, bool rdonly = false);
-
-/**
- * Id maps are specified in syntax:
- *
- *      <type>=<mapped>[-<host>[-<range>]]
- *
- * - `type` is one of `u` for UID or `g` for GID.
- * - `mapped` is the beginning of the ID range inside the sandbox.
- * - `host` is start of outside IDs. Same as mapped if only one number is given.
- * - `range` is the number of IDs in the range. Default and min. is 1.
- */
-int createUsernamespaceWithMappings(const std::string & mappings_str, uid_t suid, gid_t sgid);
-
-int createUsernamespaceWithMappings(const IDMapper & maps);
-
-void writeIDMapFile(const Path & filepath, const std::vector<IDMapping> & mappings, IDMapType type);
-
 }
