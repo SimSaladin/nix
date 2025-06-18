@@ -462,7 +462,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 {
                     .source   = i.second.source,
                     .optional = i.second.optional,
-                    .rdonly   = i.second.rdonly,
+                    .rdonly   = i.second.readOnly,
                     .idmap    = parseIDMappingsList(i.second.idmap),
                 };
         userMountNSHelper.addChrootPathsWithIDMap(result);

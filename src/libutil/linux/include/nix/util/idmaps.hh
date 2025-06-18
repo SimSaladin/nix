@@ -52,6 +52,7 @@ public:
 
 /**
  * Like ChrootPath in nixstore but with additional fields.
+ * TODO: replace with SandboxPath
  */
 struct IDMappedChrootPath
 {
