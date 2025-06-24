@@ -122,17 +122,44 @@ static void setupSeccomp()
 #  endif
 }
 
+static constexpr char SANDBOX_SYNC_WRITE_CHILD_PID[] = "%d";
+static constexpr char SANDBOX_SYNC_UPDATED_NAMESPACE[] = "1";
+static constexpr char SANDBOX_SYNC_MSG_IDMAP_MOUNT[] = "M%s";
+static constexpr char SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK[] = "m";
+static constexpr char SANDBOX_SYNC_PAUSED_BEFORE_CHROOT[]  = "2";
+static constexpr char SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK[]  = "2";
+static constexpr char SANDBOX_SYNC_SETUP_FINISHED[] = "\1";
+
+/** Merges mount option (2nd) into flags (1st argument). Later added flags
+ * that conflict with earlier flags cause the conflicting flags to be erased.
+ */
 static uint64_t mergeIntoMountOpts(uint64_t oset, uint64_t o) {
     for (const auto & [mask, _] : SandboxPath::exclusiveOptionMasks)
         if (o & mask) return (oset & ~mask) | o;
     return oset | o;
 };
 
+/** Combine all MountOpt's from the Iterable into the argument. */
 template<typename Iterable>
 static uint64_t combineMountOpts(uint64_t init, const Iterable& opts)
 {
     return std::transform_reduce(std::begin(opts), std::end(opts), init, mergeIntoMountOpts,
         [](const SandboxPath::MountOpt & o) { return static_cast<uint64_t>(o); });
+};
+
+/** Get combined wanted flag set for use with mount(2) or mount_attr if newApi
+ * is true. mount(2) flags are mapped to mount_setattr flags where
+ * possible/necessary. */
+static inline uint64_t sandboxPathMountFlags(const SandboxPath& spath, bool newApi = false, uint64_t initFlags = 0) {
+    auto flags = initFlags;
+    if (spath.readOnly) flags = combineMountOpts(flags, spath.readOnlyDefaults);
+    flags = combineMountOpts(flags, spath.options);
+    if (newApi) {
+        auto newFlags = std::transform_reduce(std::begin(spath.flagsToMountAttr), std::end(spath.flagsToMountAttr),
+            initFlags, mergeIntoMountOpts, [flags](const auto& p) { return (flags & p.first) ? p.second : 0; });
+        return newFlags;
+    }
+    return flags;
 };
 
 static void doBind(const SandboxPath & v, const Path & target)
@@ -144,8 +171,7 @@ static void doBind(const SandboxPath & v, const Path & target)
             throw SysError("bind mount from '%1%' to '%2%' failed", v.source, target);
 
         // set extra options when wanted
-        auto flags = v.readOnly ? combineMountOpts(0, SandboxPath::readOnlyDefaults) : 0;
-        flags = combineMountOpts(flags, v.options);
+        auto flags = sandboxPathMountFlags(v);
         if (flags != 0) {
             // initial mount wouldn't respect MS_RDONLY, must remount
             debug("remounting '%s' with flags: %d", target, flags);
@@ -190,6 +216,114 @@ static void doBind(const SandboxPath & v, const Path & target)
         bindMount();
     }
 }
+
+/**
+ * Makes an ID-mapping bind mount.
+ *
+ * mount(2) does not support ID mapping. We need to use the new
+ * mount_setattr(2) syscall API and also open_tree() and move_mount().
+ * None of those have wrappers, yet.
+ *
+ * Use slave propagation by default so that nested mounts from host are
+ * propagated if added but nesting mounts in the sandbox namespace does not
+ * propagate back.
+ */
+void bindMountWithIDMap(const SandboxPath & spath, const Path & target, int userns_fd)
+{
+    auto source = spath.source;
+
+    debug("bind mounting ID-mapped '%s' to '%s' with userns=%d", source, target, userns_fd);
+
+    auto maybeSt = maybeLstat(source);
+    if (!maybeSt) {
+        if (spath.optional) return;
+        else throw SysError("stat path '%s'", source);
+    }
+
+    // Ensure that parent of target path is a directory
+    createDirs(dirOf(target));
+
+    // For a directory, ensure the whole path is a directory. Otherwise ensure
+    // it's a file (symlinks can be bind-mounted on files).
+    if (S_ISDIR(maybeSt->st_mode))
+        createDirs(target);
+    else
+        writeFile(target, "");
+
+    // Open source with open_tree()
+    AutoCloseFD tfd = open_tree(-EBADF, source.c_str(), spath.flagsOpenTree);
+    if (tfd.get() == -1)
+        throw SysError("open_tree '%s'", source);
+
+    // Construct the mount_attr for mount_setattr()
+    mount_attr attr = {
+        .attr_set = sandboxPathMountFlags(spath, true, 0),
+        .propagation = MS_SLAVE
+    };
+    if (userns_fd > 0) {
+        attr.attr_set |= MOUNT_ATTR_IDMAP;
+        // FD's are int, except when ABI compatibility requires otherwise
+        attr.userns_fd = static_cast<uint64_t>(userns_fd);
+    }
+
+    // Set our attributes using mount_setattr()
+    if (mount_setattr(tfd.get(), "", spath.flagsMountSetattr, &attr, sizeof(struct mount_attr)) == -1)
+        throw SysError("mount_setattr '%s'", source);
+
+    // Add the new mount to the sandbox
+    if (move_mount(tfd.get(), "", -EBADF, target.c_str(), spath.flagsMoveMount) == -1)
+        throw SysError("move_mount '%s'", source);
+}
+
+
+/**
+ * Extended bind-mount routine using the new mount fd API. Supports
+ * idmapping etc.
+ *
+ * ID-mapped bind mounts. Setup these from the parent (initial)
+ * namespace, because here we still have all the needed capabilities and
+ * are not constrained by the sandbox user ns. For every unique ID-map a
+ * user namespace is created with the specified mappings. Various criteria
+ * are required:
+ *
+ * - The caller needs to be owner of current user namespace.
+ * - The caller UID/GID has to be mapped in the current namespace.
+ * - The mapped user IDs (group IDs) must in turn have a mapping in the parent user namespace.
+ * - Mapping UID 0 requires CAP_SETFCAP
+ * - To write maps for other than effective UID/GID, CAP_SETUID/GID is needed.
+ * - A child user namespace inherits the /proc/pid/setgroups setting from its parent and can't modify it.
+ *
+ * Mounts are performed in the sandbox's mount namespace.
+ *
+ * called from callback handler
+ */
+void doBindEx(const SandboxPath & spath, const Path & target, int sandboxMountNamespaceFd, int idmapUserNsFd)
+{
+    debug("Mount request: traget='%s'", target);
+
+    /** This should be called from a child process! */
+    auto wrapper = [&]() {
+        try {
+            // set mount namespace
+            if (setns(sandboxMountNamespaceFd, 0) == -1)
+                throw SysError("idmap-mount: entering sandbox mount namespace");
+
+            bindMountWithIDMap(spath, target, idmapUserNsFd);
+
+        } catch (Error & e) {
+            debug("IDMap mount error: %s", e.message());
+            _exit(1);
+        }
+        _exit(0);
+    };
+
+    // make the mount in a sub-process because we have to change mount
+    // namespace for the call.
+    Pid child(startProcess([&]() { wrapper(); }));
+    int status = child.wait();
+    if (status != 0)
+        throw Error("could not add id-mapped mounts to sandbox");
+};
 
 struct LinuxDerivationBuilder : DerivationBuilderImpl
 {
@@ -386,11 +520,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         if (drvOptions.useUidRange(drv) && (!buildUser || buildUser->getUIDCount() < 65536))
             throw Error("feature 'uid-range' requires the setting '%s' to be enabled", settings.autoAllocateUids.name);
 
-        // TODO do we know host ids here yet?
-        sandboxIDMap.setPrimaryIDs(sandboxUid(), sandboxGid(),
-                buildUser ? buildUser->getUID() : getuid(),
-                buildUser ? buildUser->getGID() : getgid(),
-                buildUser->getUIDCount());
+        sandboxIDMap.setPrimaryIDs(sandboxUid(), sandboxGid());
 
         /* Attempt to set supplementary groups only if auto-allocate-uids
            and we are running privileged. (Otherwise setgroups will
@@ -455,7 +585,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         // than  others...
         for (auto & i : pathsInChroot)
             if (!i.second.idmap.empty())
-                sandboxIDMap.recordMountIDMap(IDMap::parse_maps(i.second.idmap));
+                sandboxIDMap.recordMountIDMap(i.second.idmap);
     }
 
     Strings getPreBuildHookArgs() override
@@ -540,7 +670,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 
                 pid_t child = startProcess([&]() { runChild(); }, options);
 
-                writeFull(sandboxControl.writeSide.get(), fmt("%d\n", child));
+                writeLine(sandboxControl.writeSide.get(), fmt(SANDBOX_SYNC_WRITE_CHILD_PID, child));
                 _exit(0);
             } catch (...) {
                 handleChildException(true);
@@ -578,31 +708,24 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 try {
                     auto ln = readLine(fdr);
                     if (ln.empty()) continue;
-                    char head = ln[0];
                     auto tail = ln.substr(1);
-                    switch (head) {
-                        case 'M': {
-                            debug("Mount request: %s", tail);
-                            auto cp = pathsInChroot.at(tail);
-                            sandboxIDMap.add_sandbox_path_handler_side(tail, IDMappedChrootPath({
-                                    .source = cp.source,
-                                    .optional = cp.optional,
-                                    .readOnly = cp.readOnly,
-                                    .idmap = IDMap::parse_maps(cp.idmap),
-                                }), chrootRootDir, sandboxMountNamespace.get());
-                            writeResponse("m");
+                    switch (ln[0]) {
+                        case SANDBOX_SYNC_MSG_IDMAP_MOUNT[0]: {
+                            auto spath = pathsInChroot.at(tail);
+                            doBindEx(spath, chrootRootDir + tail, sandboxMountNamespace.get(), sandboxIDMap.getIDMapUserNsFd(spath.idmap));
+                            writeResponse(SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK);
                             break;
                                   }
-                        case '2':
-                            writeResponse("2");
+                        case SANDBOX_SYNC_PAUSED_BEFORE_CHROOT[0]:
+                            writeResponse(SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK);
                             throw EndOfFile("stream-ended");
                             break;
-                        case '\1':
+                        case SANDBOX_SYNC_SETUP_FINISHED[0]:
                             debug("Setup finished");
                             throw EndOfFile("stream-ended");
                             break;
                         default:
-                            throw Error("Unexpected inptu from build setup: %s%s", head, tail);
+                            throw Error("Unexpected input from build setup: %s%s", ln[0], tail);
                             break;
                     }
                 }
@@ -615,9 +738,10 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             /* Set the UID/GID mapping of the builder's user namespace
                such that the sandbox user maps to the build user, or to
                the calling user (if build users are disabled). */
-            //uid_t hostUid = buildUser ? buildUser->getUID() : getuid();
-            //uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
+            uid_t hostUid = buildUser ? buildUser->getUID() : getuid();
+            uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
             //uid_t nrIds = buildUser ? buildUser->getUIDCount() : 1;
+            sandboxIDMap.setPrimaryHostIDs(hostUid, hostGid);
 
             // Writes setgroups, uid_map and gid_map
             sandboxIDMap.write_userns_map(pid);
@@ -649,7 +773,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             writeFile(*cgroup + "/cgroup.procs", fmt("%d", (pid_t) pid));
 
         /* Signal the builder that we've updated its user namespace. */
-        writeFull(userNamespaceSync.writeSide.get(), "1\n");
+        writeFull(userNamespaceSync.writeSide.get(), fmt("%s\n", SANDBOX_SYNC_UPDATED_NAMESPACE));
     }
 
     void enterChroot() override
@@ -672,7 +796,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             }
         };
 
-        syncNamespaceExpect('1', true);
+        syncNamespaceExpect(SANDBOX_SYNC_UPDATED_NAMESPACE[0], true);
 
         if (derivationType.isSandboxed()) {
 
@@ -797,7 +921,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 chmod_(dst, 0555);
             } else
 #  endif
-            if (i.second.idmap == "")
+            if (i.second.idmap.empty())
                 doBind(i.second, chrootRootDir + i.first);
             else {
                /** In order to do ID-mapping mounts without much restrictions
@@ -809,9 +933,9 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
                 * work properly no matter what I tried however. (Lot of fun
                 * to diagnose also what's nested user namespaces at least
                 * three layers deep... */
-                writeFull(sandboxControl.writeSide.get(), fmt("M%s\n", i.first));
+                writeLine(sandboxControl.writeSide.get(), fmt(SANDBOX_SYNC_MSG_IDMAP_MOUNT, i.first));
                 // Wait for the parent to perform the mount
-                syncNamespaceExpect('m');
+                syncNamespaceExpect(SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK[0]);
             }
         }
 
@@ -868,8 +992,8 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
          * unless you altered the sandbox asynchronously from a different thread.
          * (Re: id-mapped mounts, we wait for each mount individually
          * already above.) */
-        writeFull(sandboxControl.writeSide.get(), "2\n");
-        syncNamespaceExpect('2');
+        writeLine(sandboxControl.writeSide.get(), SANDBOX_SYNC_PAUSED_BEFORE_CHROOT);
+        syncNamespaceExpect(SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK[0]);
 
         /* Unshare this mount namespace. This is necessary because
            pivot_root() below changes the root of the mount

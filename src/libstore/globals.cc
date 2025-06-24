@@ -312,6 +312,69 @@ NLOHMANN_JSON_SERIALIZE_ENUM(SandboxPath::MountOpt, {
 #endif
 });
 
+inline static constexpr std::string idmap_json_fields[] = { "type", "host" /* host_id */, "mapped" /* mapped_id */, "range" };
+
+// IDMapping JSON serialisation (object | string)
+template<typename BasicJsonType>
+void to_json(BasicJsonType& j, const IDMapping& t)
+{
+    if (j.is_object() || true) { // serialise as object
+        j[idmap_json_fields[0]] = fmt("%s", t.type);
+        j[idmap_json_fields[1]] = t.host_id;
+        if (t.mapped_id != t.host_id)
+            j[idmap_json_fields[2]] = t.mapped_id;
+        if (t.range != 1)
+            j[idmap_json_fields[3]] = t.range;
+    } else
+        // format a string
+        j = fmt("%c=%d-%d-%d", (char)t.type, t.host_id, t.mapped_id, t.range);
+}
+
+/* IDMapping JSON parse (object | string) */
+template<typename BasicJsonType>
+void from_json(const BasicJsonType& j, IDMapping& t)
+{
+    using nlohmann::json;
+    if (j.is_string()) {
+        t = IDMapping::parse(j);
+    }
+    else if (j.is_object()) {
+        try {
+            std::string type_s = j.at(idmap_json_fields[0]);
+            t.type = IDMapping::parse_type(type_s[0]);
+        } catch (const json::out_of_range & e) {
+            throw json::parse_error::create(101, 0, fmt("ID mapping with no type field: %s", e.what()), nullptr);
+        }
+        try {
+            t.host_id = j.at(idmap_json_fields[1]);
+        } catch (const json::out_of_range & e) {
+            throw json::parse_error::create(101, 0, fmt("ID mapping without value for from: %s", e.what()), nullptr);
+        }
+        t.mapped_id = j.value(idmap_json_fields[2], t.host_id);
+        t.range = j.value(idmap_json_fields[3], 1);
+    }
+    else
+        throw json::parse_error::create(101, 0, "ID map was not a string or object.", nullptr);
+}
+
+// Parsing a set of ID maps from either a string (separated by ",") or array.
+template<typename BasicJsonType>
+void from_json(const BasicJsonType& j, IDMap::Set& t)
+{
+    if (j.is_string())
+        t = IDMap::parse_maps(j);
+    else if (j.is_array())
+        for (const auto & j2 : j) {
+            IDMapping m;
+            from_json(j2, m);
+            if (t.contains(m))
+                throw nlohmann::json::parse_error::create(101, 0, fmt("ID map was declared multiple times: %s", m), nullptr);
+            t.insert(std::move(m));
+        }
+    else
+        throw nlohmann::json::parse_error::create(101, 0, "ID map was not a string or array", nullptr);
+}
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SandboxPath, source, optional, readOnly, options, idmap);
 
 /**
@@ -370,7 +433,7 @@ template<> std::string BaseSetting<SandboxPaths>::to_string() const
         if (v.optional) po.emplace("optional", v.optional);
         if (v.readOnly) po.emplace("readOnly", v.readOnly);
         if (!v.options.empty()) po.emplace("options", v.options);
-        if (v.idmap != "") po.emplace("idmap", v.idmap);
+        if (!v.idmap.empty()) po.emplace("idmap", v.idmap);
         res.emplace(k, std::move(po));
     }
     return res.dump();

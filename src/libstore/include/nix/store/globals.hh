@@ -14,6 +14,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/users.hh"
+#include "nix/util/idmaps.hh"
 
 #include "nix/store/config.hh"
 
@@ -32,13 +33,14 @@ public:
         nodev = MS_NODEV,
         noexec = MS_NOEXEC,
         nosuid = MS_NOSUID,
-        noatime = MS_NOATIME,
-        nodiratime = MS_NODIRATIME,
-        relatime = MS_RELATIME,
-        strictatime = MS_STRICTATIME, /* overrides any atime/relatime */
+        nodiratime = MS_NODIRATIME, // MOUNT_ATTR_NODIRATIME
+        noatime = MS_NOATIME, // MOUNT_ATTR_NOATIME
+        relatime = MS_RELATIME, // MOUNT_ATTR_RELATIME
+        strictatime = MS_STRICTATIME, /* overrides any atime/relatime */ // MOUNT_ATTR_STRICTATIME
         private_ = MS_PRIVATE,
         slave = MS_SLAVE,
-        unbindable = MS_UNBINDABLE
+        unbindable = MS_UNBINDABLE,
+        nosymfollow = MS_NOSYMFOLLOW // MOUNT_ATTR_NOSYMFOLLOW
 #else
         ro  // FIXME: do any options make sense on other that linux?
 #endif
@@ -51,9 +53,33 @@ public:
     /* Only one atime option should be enabled at a time. Same for propagation
      * style.*/
     constexpr static std::pair<uint64_t, const char*> exclusiveOptionMasks[] = {
-        {MS_NOATIME | MS_NODIRATIME | MS_RELATIME | MS_STRICTATIME, "option-atime"},
         {MS_SHARED | MS_PRIVATE | MS_SLAVE, "propagation"},
+        {MS_NOATIME | MS_RELATIME | MS_STRICTATIME, "option-atime"},
+        {MOUNT_ATTR_NOATIME | MOUNT_ATTR_RELATIME | MOUNT_ATTR_STRICTATIME, "attr-atime"},
     };
+
+    /* Flags for mount(2) and flags for mount_attr (mount_setattr()) have
+     * equalities. The setattr flags serve the same purpose but we don't
+     * expose those flags directly hence mapping. */
+    constexpr static std::pair<uint64_t, uint64_t> flagsToMountAttr[] = {
+        { MS_RDONLY, MOUNT_ATTR_RDONLY },
+        { MS_NODIRATIME, MOUNT_ATTR_NODIRATIME },
+        { MS_NOATIME, MOUNT_ATTR_NOATIME },
+        { MS_RELATIME, MOUNT_ATTR_RELATIME },
+        { MS_STRICTATIME, MOUNT_ATTR_STRICTATIME },
+        { MS_NODEV, MOUNT_ATTR_NODEV },
+        { MS_NOSUID, MOUNT_ATTR_NOSUID },
+        { MS_NOEXEC, MOUNT_ATTR_NOEXEC },
+        { MS_NOSYMFOLLOW, MOUNT_ATTR_NOSYMFOLLOW },
+        { MS_REC, AT_RECURSIVE },
+    };
+
+    /* Flags for open_tree() (when using it), and mount_setattr(), move_mount() */
+    uint64_t flagsOpenTree = AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLOEXEC | OPEN_TREE_CLONE;
+    uint64_t flagsMountSetattr = AT_EMPTY_PATH | AT_RECURSIVE;
+    uint64_t flagsMoveMount = MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH;
+
+    //static constexpr uint64_t flagPropagationEx = MS_SLAVE; // .alt.: MS_PRIVATE,
 #endif
 
     Path source;
@@ -71,12 +97,21 @@ public:
 
     std::vector<MountOpt> options;
 
-    std::string idmap;
+    IDMap::Set idmap;
 
-    SandboxPath(std::string source = "", bool optional = false,
-        bool readOnly = false, std::vector<MountOpt> options = { }, std::string idmap = "") :
-        source(std::string(std::move(source))), optional(optional),
-        readOnly(readOnly), options(std::move(options)), idmap(std::move(idmap)) { }
+    SandboxPath(
+        std::string source = "",
+        bool optional = false,
+        bool readOnly = false,
+        std::vector<MountOpt> options = { },
+        IDMap::Set idmap = {}
+        ) :
+        source(std::string(std::move(source))),
+        optional(optional),
+        readOnly(readOnly),
+        options(std::move(options)),
+        idmap(std::move(idmap))
+        { }
 
     /* This is to enable the full implicit conversion from e.g. const char[],
      * even when binding a reference. Code can specify paths with literals and
@@ -780,6 +815,29 @@ public:
             flags can also be used: `nodiratime`, `relatime`, `strictatime`,
             `unbindable`, `private`, `slave`.
 
+        - `idmap` (string | string array | object array)
+
+            Creates an ID-mapped bind-mount. For more details see
+            `X-mount.idmap` in `mount(8)`.
+
+            The syntax for the string form is
+            `<type>=<id-from>-<id-to>[-<range>]` where type is either `u` or
+            `g` or `b` for both, `id-to` defines the first ID of the range
+            mapped inside the sandbox, `id-from` is the first ID outside the
+            sandbox and `range` is the size of mapped ID range (1 if unset).
+            Multiple mappings can be given by separating them with ",". For
+            example, `:idmap=u=30000-1000,g=30000-100-1` will map UID 1000 and
+            GID 100 (primary IDs of the build user) to ID 30000 in the host
+            filesystem.
+
+            Note that by default only UID 1000 and GID 100 are mapped in the
+            sandbox. To make use of other GIDs this should be combined with
+            [`supplementary-groups`](#conf-supplementary-groups`). Unmapped
+            IDs are not usable in the sandbox.
+
+            Linux 5.12+ only. Only some filesystems support ID-mapped mounts.
+            See `mount_setattr(2)` for a list.
+
           Full example:
 
           ```nix
@@ -789,6 +847,15 @@ public:
               "optional" : true,                          # (false)
               "readOnly" : true,                          # (false)
               "options"  : [ "optionA", "optionB", ... ], # ()
+
+              "idmap"    : "u=100-100-1, g=100-30000"     # Alterntaive 1 (string)
+
+                           [ "b=30000", ... ]             # Alternative 2 (string list)
+
+                           [{ "type":  "ubg",             # Alternative 3 (object list)
+                              "from":  1000,
+                              "to":    2000,              # Optional, default: as from
+                              "range": 100 }, ...]        # Optional, default: 1
             },
 
             # ...
