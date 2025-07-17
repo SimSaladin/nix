@@ -19,7 +19,7 @@ inline constexpr uint64_t IDMAP_LIMIT = 340;
  *
  * In configs this is typically parsed from something such as:
  *
- *    "Type=HostID:ContainerID:Range"
+ *    "Type=ContainerID:HostID:Range"
  *
  * E.g. u=1000:0:1, g=100:0:1, etc.
  */
@@ -42,11 +42,53 @@ struct IDMapping
     bool overlaps_with_any(auto maps) const;
     bool contains(const T) const;
     std::string to_string() const;
+    std::string to_map_string(const bool = false) const;
     friend std::ostream & operator<<(std::ostream &, const T &);
     friend std::ostream & operator<<(std::ostream &, const IDMapping &);
 
     static IDMapping parse(const std::string &);
     static T parse_type(const char);
+
+    // IDMapping JSON serialisation (object | string)
+    template<typename BasicJsonType>
+    friend void to_json(BasicJsonType & j, const IDMapping & t)
+    {
+        // serialise as object
+        j["type"] = fmt("%s", t.type);
+        j["mount"] = t.mapped_id;
+        if (t.mapped_id != t.host_id)
+            j["host"] = t.host_id;
+        if (t.range != 1)
+            j["count"] = t.range;
+        // serialise as string
+        // j = t.to_string();
+    }
+
+    /* IDMapping JSON parse (object | string) */
+    template<typename BasicJsonType>
+    friend void from_json(const BasicJsonType & j, IDMapping & t)
+    {
+        using nlohmann::json;
+        if (j.is_string())
+            t = parse(j);
+        else if (j.is_object()) {
+            try {
+                std::string type_s = j.value("type", "b");
+                t.type = parse_type(type_s[0]);
+            } catch (const json::out_of_range & e) {
+                throw json::parse_error::create(101, 0, fmt("ID mapping with no type field: %s", e.what()), nullptr);
+            }
+            try {
+                t.mapped_id = j.at("mount");
+            } catch (const json::out_of_range & e) {
+                throw json::parse_error::create(
+                    101, 0, fmt("ID mapping without value for from: %s", e.what()), nullptr);
+            }
+            t.host_id = j.value("host", t.mapped_id);
+            t.range = j.value("count", 1);
+        } else
+            throw json::parse_error::create(101, 0, "ID map was not a string or object.", nullptr);
+    }
 };
 
 /**
@@ -66,11 +108,14 @@ private:
     Vec explicit_maps, fallback_maps;
 
 public:
-    IDMap(const Vec & explicit_maps);
-    IDMap(const std::string & explicit_maps = "");
+    IDMap(const Vec & = {}, const Vec & = {});
 
     void add_explicit(IDMapping map);
-    void add_explicit(const std::string & map);
+
+    bool empty() const
+    {
+        return explicit_maps.empty();
+    };
 
     /**
      * Mount idmap <id-from>:<id-to> only makes sense when there's a
@@ -84,9 +129,7 @@ public:
      * Calculate both UID and GID maps (no overlapping).
      */
     Vec collectBoth() const;
-    Vec collect(const IDMapping::T type) const;
-
-    friend std::ostream & operator<<(std::ostream &, const IDMap &);
+    Vec collect(const IDMapping::T, const Vec & = {}) const;
 
     /**
      * Transform maps of given type: any "from" mapped id is remapped to "to"
@@ -103,6 +146,32 @@ public:
      * missing mappings in caller namespace, missing permissions, ...)
      */
     static Vec parse(const std::string &);
+
+    friend bool operator==(const IDMap &, const IDMap &) = default;
+
+    friend std::ostream & operator<<(std::ostream &, const IDMap &);
+
+    template<typename BasicJsonType>
+    friend void to_json(BasicJsonType & j, const IDMap & t)
+    {
+        to_json(j, t.explicit_maps);
+    };
+
+    // Parsing a set of ID maps from either a string (separated by ",") or array.
+    template<typename BasicJsonType>
+    friend void from_json(const BasicJsonType & j, IDMap & t)
+    {
+        if (j.is_string())
+            t = IDMap(IDMap::parse(j));
+        else if (j.is_array())
+            for (const auto & j2 : j) {
+                IDMapping m;
+                from_json(j2, m);
+                t.add_explicit(std::move(m));
+            }
+        else
+            throw nlohmann::json::parse_error::create(101, 0, "ID map was not a string or array", nullptr);
+    };
 };
 
 /**
@@ -135,6 +204,21 @@ private:
      */
     std::map<gid_t, gid_t> supplementaryGIDs;
 
+    /**
+     * User namespace FDs for idmapped mounts. We store each unique map
+     * definition for re-use (creating an idmapping fd requires us to
+     * setup a whole new user namespace).
+     */
+    std::map<IDMap::Vec, AutoCloseFD> userNamespaceFDs = {};
+
+    std::optional<bool> _useSupplementaryGroups;
+
+    bool useSupplementaryGroupsInner() {
+        if (!_useSupplementaryGroups.has_value())
+            _useSupplementaryGroups = std::optional(useSupplementaryGroups());
+        return *_useSupplementaryGroups;
+    };
+
 public:
     /**
      * Build user's UID/GID within the sandbox.
@@ -158,11 +242,17 @@ public:
         return "nixbld";
     };
 
+    gid_t hostGid = (gid_t)-1;
+    uid_t hostUid = (uid_t)-1;
+
     /* Host primary UID and GID. */
-    virtual uid_t hostUid() const = 0;
-    virtual gid_t hostGid() const = 0;
-    virtual uint nrUids() const = 0;
-    virtual uint nrGids() const = 0;
+    void setPrimaryID(uid_t uid, gid_t gid, uint nrids)
+    {
+        hostUid = uid;
+        hostGid = gid;
+        primaryIDMap.add_explicit({IDMapping::T::User, uid, sandboxUid(), nrids});
+        primaryIDMap.add_explicit({IDMapping::T::Group, gid, sandboxGid(), nrids});
+    };
 
     /* Whether or not supplementary groups should be set. If false sup groups
      * are emptied. */
@@ -199,7 +289,7 @@ public:
     /**
      * Get the host-side GIDs that should be assigned with setgroups().
      */
-    std::vector<gid_t> supplementaryHostGIDs() const;
+    std::vector<gid_t> supplementaryHostGIDs();
 
     /**
      * Format minimal /etc/groups for the sandbox
@@ -216,28 +306,20 @@ public:
      */
     void writePasswdFile(const Path &, Path & homeDir) const;
 
-private:
     /**
      * Recover or create usernamespace fd for idmapping.
      */
-    int getIDMapUserNsFd(IDMap::Vec);
+    int getIDMapUserNsFd(IDMap);
 
     /**
      * IDMapped mounts' ID maps are separate from the build sandbox's
      * usernamespace by default. But for convenience the maps of id-mapped
      * mounts are recreated in the builder process namespace when it does not
      * overlap with any explicitly declared mapping. */
-    void recordMountIDMap(IDMap::Vec map);
-
-    /**
-     * User namespace FDs for idmapped mounts. We store each unique map
-     * definition for re-use (creating an idmapping fd requires us to
-     * setup a whole new user namespace).
-     */
-    std::map<IDMap::Vec, AutoCloseFD> userNamespaceFDs = {};
+    void recordMountIDMap(IDMap);
 };
 
 void write_setgroups(const pid_t, const bool = true);
-void write_id_map(const pid_t, const IDMap &, const IDMapping::T = IDMapping::T::Both);
 int createUsernamespaceWithMappings(const IDMap & mapper);
+void writeIDMap(Path, const IDMap::Vec idmap, const bool inverse = false);
 }

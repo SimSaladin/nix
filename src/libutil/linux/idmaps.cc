@@ -19,13 +19,43 @@ static std::ofstream open_ofstream(const Path & fp)
     return os;
 }
 
+/**
+ * Given a ProcessID, ID-map and ID-map type, writes the corresponding uid_map
+ * and/or gid_map for the process (e.g. namespace).
+ *
+ * The inverse parameter should be true when writing maps for idmapped mount
+ * namespaces: the nsid and host_id are then flipped.
+ */
+static void writeIDMap(const pid_t pid, const IDMap & idmap, const IDMapping::T type, bool inverse = false, IDMap::Vec filter = {})
+{
+    if (type == IDMapping::T::Both) {
+        writeIDMap(pid, idmap, IDMapping::T::User, inverse, filter);
+        writeIDMap(pid, idmap, IDMapping::T::Group, inverse, filter);
+        return;
+    }
+    Path filepath = fmt("/proc/%d/%cid_map", pid, (char) type);
+    writeIDMap(filepath, idmap.collect(type, filter), inverse);
+}
+
+void writeIDMap(Path filepath, const IDMap::Vec idmap, const bool inverse)
+{
+    std::ostringstream oss;
+    for (const auto & m : idmap)
+        oss << m.to_map_string(inverse) << "\n";
+    std::string content = oss.str();
+    if (content.size() > IDMAP_MAX_SIZE)
+        throw Error("Size of ID map exceeds the 4K length limit: '%s'", idmap);
+    // has to be a single write()
+    writeFile(filepath, content);
+}
+
 int createUsernamespaceWithMappings(const IDMap & mapper)
 {
     static const std::string SYNC_PARENT_NAMESPACE_READY = "1";
     static const std::string SYNC_PARENT_ERREXIT = "0";
     static const std::string SYNC_CHILD_EXIT = "X";
 
-    // debug("setting up user namespace for ID-mapping: '%s'", mapper);
+    debug("new user namespace for ID-mapping: '%s'", mapper);
 
     // child-to-parent / other way around
     Pipe pipeC2P, pipeP2C;
@@ -71,10 +101,10 @@ int createUsernamespaceWithMappings(const IDMap & mapper)
 
     // Write setgroups, uid_map & gid_map
     write_setgroups(pid);
-    write_id_map(pid, mapper, IDMapping::T::Both);
+    writeIDMap(pid, mapper, IDMapping::T::Both, true);
 
     // Open namespace fd
-    int userFd = open(fmt("/proc/%d/ns/user", (pid_t) pid).c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    int userFd = open(fmt("/proc/%d/ns/user", (pid_t) pid).c_str(), O_RDONLY /*| O_CLOEXEC*/ | O_NOCTTY);
     if (userFd < 0)
         throw SysError("open(userFd)");
 
@@ -84,37 +114,6 @@ int createUsernamespaceWithMappings(const IDMap & mapper)
         throw Error("idmap: process did not exit gracefully");
 
     return userFd;
-}
-
-/**
- * Given a ProcessID, ID-map and ID-map type, writes the corresponding uid_map
- * and/or gid_map for the process (e.g. namespace)
- */
-void write_id_map(const pid_t pid, const IDMap & map, const IDMapping::T type)
-{
-    if (type == IDMapping::T::Both) {
-        write_id_map(pid, map, IDMapping::T::User);
-        write_id_map(pid, map, IDMapping::T::Group);
-        return;
-    }
-
-    auto filepath = fmt("/proc/%d/%cid_map", pid, static_cast<char>(type));
-
-    std::ostringstream oss;
-    for (const auto & m : map.collect(type))
-        oss << m.to_string();
-
-    std::string content = oss.str();
-    if (content.size() > IDMAP_MAX_SIZE)
-        throw Error("Size of ID map exceeds the 4K length limit for '%s': %s", filepath, map);
-
-    debug("idmap write %s (%s)", filepath, replaceStrings(content, "\n", ";"));
-
-    std::ofstream file = open_ofstream(filepath);
-    file << content;
-    if (!file)
-        throw SysError("write %s", filepath);
-    file.close();
 }
 
 /**
@@ -148,9 +147,13 @@ std::strong_ordering operator<=>(const IDMapping & a, const IDMapping & b)
         return a.mapped_id <=> b.mapped_id;
     return a.range <=> b.range;
 }
+std::string IDMapping::to_string() const
+{
+    return fmt("%c:%d:%d:%d", static_cast<char>(type), mapped_id, host_id, range);
+}
 std::ostream & operator<<(std::ostream & os, const IDMapping & m)
 {
-    return os << fmt("%c=%d:%d:%d", static_cast<char>(m.type), m.host_id, m.mapped_id, m.range);
+    return os << m.to_string();
 }
 std::ostream & operator<<(std::ostream & os, const IDMapping::T & t)
 {
@@ -172,29 +175,32 @@ bool IDMapping::overlaps_with_any(auto maps) const
     return std::find_if(maps.begin(), maps.end(), [&](const IDMapping & m) { return this->overlaps_with(m); })
            != maps.end();
 }
-std::string IDMapping::to_string() const
+std::string IDMapping::to_map_string(const bool inverse) const
 {
     assert(range > 0);
-    return fmt("%d %d %d\n", mapped_id, host_id, range);
+    return inverse ? fmt("%d %d %d", host_id, mapped_id, range) : fmt("%d %d %d", mapped_id, host_id, range);
 }
-/**
- * Parsed format: T=H:M:R
- */
 IDMapping IDMapping::parse(const std::string & str)
 {
-    if (str.size() < 3 || str[1] != '=')
+    IDMapping res;
+    auto parts = splitString<Strings>(str, "=-:/");
+    if (parts.size() < 1 || parts.size() > 4)
         throw Error("Invalid ID mapping format: '%s'", str);
-    IDMapping res(parse_type(str[0]));
-    auto parts = splitString<Strings>(str.substr(2), "-:/");
-    if (parts.size() > 3)
-        throw Error("Invalid ID mapping format: '%s'", str);
-    if (!parts.empty()) {
-        res.host_id = *string2Int<id_t>(parts.front());
+    if (parts.front().empty() || std::isdigit(parts.front()[0])) {
+        res.type = T::Both;
+    } else {
+        res.type = parse_type(parts.front()[0]);
         parts.pop_front();
     }
     if (!parts.empty()) {
         res.mapped_id = *string2Int<id_t>(parts.front());
+        parts.pop_front();
     }
+    if (!parts.empty()) {
+        res.host_id = *string2Int<id_t>(parts.front());
+        parts.pop_front();
+    } else
+        res.host_id = res.mapped_id;
     if (!parts.empty())
         res.range = *string2Int<uint>(parts.front());
     return res;
@@ -216,15 +222,11 @@ IDMapping::T IDMapping::parse_type(const char ch)
 
 // IDMap
 
-IDMap::IDMap(const Vec & expl)
+IDMap::IDMap(const Vec & expl, const Vec & fallback)
 {
     for (const auto & m : expl)
         add_explicit(m);
-}
-
-IDMap::IDMap(const std::string & expl)
-{
-    add_explicit(expl);
+    fallback_maps = fallback;
 }
 
 IDMap::Vec IDMap::parse(const std::string & str)
@@ -243,29 +245,25 @@ void IDMap::add_explicit(IDMapping map)
     explicit_maps.insert(map);
 }
 
-void IDMap::add_explicit(const std::string & maps)
-{
-    for (const auto & map : parse(maps))
-        add_explicit(map);
-}
-
 void IDMap::add_fallback(const IDMapping & m)
 {
-    fallback_maps.insert({m.type, m.host_id, m.host_id, m.range});
+    fallback_maps.insert({m.type, m.mapped_id, m.mapped_id, m.range});
 }
 
 void IDMap::transform(const IDMapping::T type, id_t from, id_t to)
 {
-    debug("idmap transform: %s: %d -> %d", type, from, to);
+    debug("idmap transform: type:%s mapped:[%d -> %d]", type, from, to);
     auto erase = [&](auto & m, auto & ms) {
-        for (auto it = ms.begin(); it != ms.end(); ++it)
+        for (auto it = ms.begin(); it != ms.end();)
             if (*it == m)
-                ms.erase(it);
+                it = ms.erase(it);
+            else
+                ++it;
     };
     auto f = [&](auto m, bool isexp) {
-        if ((m.type == type || m.type == IDMapping::T::Both) && m.mapped_id == from) {
+        if (m.contains(type) && m.mapped_id == from) {
             isexp ? erase(m, explicit_maps) : erase(m, fallback_maps);
-            m.host_id = to;
+            m.mapped_id = to;
             if (isexp)
                 add_explicit(m);
             else
@@ -278,16 +276,24 @@ void IDMap::transform(const IDMapping::T type, id_t from, id_t to)
         f(m, false);
 }
 
-IDMap::Vec IDMap::collect(const IDMapping::T type) const
+IDMap::Vec IDMap::collect(const IDMapping::T type, const IDMap::Vec & filter) const
 {
     Vec res;
+    auto matches = [](auto fis, auto q){
+        for (auto & fi : fis) {
+            if (!fi.contains(q.type)) continue;
+            if ((fi.mapped_id <= q.host_id) && (q.host_id + q.range <= fi.mapped_id + fi.range))
+                return true;
+        }
+        return false;
+    };
     for (auto m : explicit_maps)
-        if (m.contains(type)) {
+        if (m.contains(type) && (filter.empty() || matches(filter, m))) {
             m.type = type;
             res.insert(m);
         }
     for (auto m : fallback_maps)
-        if (m.contains(type) && !m.overlaps_with_any(res)) {
+        if (m.contains(type) && (filter.empty() || matches(filter, m)) && !m.overlaps_with_any(res)) {
             m.type = type;
             res.insert(m);
         }
@@ -324,7 +330,7 @@ void SandboxIDMap::addSandboxGroup(const gid_t gid, std::string name, const std:
 
 void SandboxIDMap::addSupplementaryGroups(const SupplementaryGroups & supGrps, const std::vector<gid_t> & gids)
 {
-    if (!useSupplementaryGroups())
+    if (!useSupplementaryGroupsInner())
         return;
 
     debug("Resolving requested supplementary groups (%d)", supGrps.size());
@@ -376,7 +382,7 @@ void SandboxIDMap::addSupplementaryGroups(const SupplementaryGroups & supGrps, c
         // Host GID sanity checks
         if (grGid == 0)
             throw Error("Group '%1%': mapping the root group (GID 0) is not a good idea", group);
-        if (hostGid() == grGid) {
+        if (hostGid == grGid) {
             warn("Group '%1%': ignored (host GID %2% is the primary builder GID)", group, grGid);
             return;
         }
@@ -432,9 +438,9 @@ void SandboxIDMap::addSupplementaryGroups(const SupplementaryGroups & supGrps, c
             add(gid, std::optional<gid_t>(gid), "");
 }
 
-std::vector<gid_t> SandboxIDMap::supplementaryHostGIDs() const
+std::vector<gid_t> SandboxIDMap::supplementaryHostGIDs()
 {
-    if (!useSupplementaryGroups())
+    if (!useSupplementaryGroupsInner())
         return {};
     std::vector<gid_t> res = {};
     for (auto [x, _] : supplementaryGIDs)
@@ -469,49 +475,47 @@ void SandboxIDMap::writePasswdFile(const Path & file, Path & homeDir) const
     ofs.close();
 };
 
-static void writeIDMap(const pid_t pid, const IDMap idmap, const IDMapping::T type)
+static IDMap::Vec readIDMapFile(const Path & filename, const IDMapping::T type)
 {
-    if (type == IDMapping::T::Both) {
-        writeIDMap(pid, idmap, IDMapping::T::User);
-        writeIDMap(pid, idmap, IDMapping::T::Group);
-        return;
+    std::ifstream file(filename);
+    if (!file)
+        throw SysError("Opening file for reading: %s", filename);
+    Finally finally([&](){ file.close(); });
+    IDMap::Vec result;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        auto items = tokenizeString<std::vector<std::string>>(line, " \t\n");
+        result.insert({type, *string2Int<id_t>(items[1]), *string2Int<id_t>(items[0]), *string2Int<uint>(items[2])});
     }
-    std::ostringstream oss;
-    for (const auto & m : idmap.collect(type))
-        oss << m.to_string();
-    std::string content = oss.str();
-    if (content.size() > IDMAP_MAX_SIZE)
-        throw Error("Size of ID map exceeds the 4K length limit: '%s'", idmap);
-
-    auto filepath = fmt("/proc/%d/%cid_map", pid, (char) type);
-    auto ofs = open_ofstream(filepath);
-    ofs << content;
-    ofs.close();
+    return result;
 }
 
 void SandboxIDMap::writeIDMapFiles(const pid_t pid, const IDMapping::T type)
 {
-    primaryIDMap.add_explicit({IDMapping::T::User, hostUid(), sandboxUid(), nrUids()});
-    primaryIDMap.add_explicit({IDMapping::T::Group, hostGid(), sandboxGid(), nrGids()});
-    if (type != IDMapping::T::User)
+    if (type != IDMapping::T::Group) {
+        auto uidmap = readIDMapFile("/proc/self/uid_map", IDMapping::T::User);
+        writeIDMap(pid, primaryIDMap, IDMapping::T::User, false, uidmap);
+    }
+    if (type != IDMapping::T::User) {
         write_setgroups(pid, true);
-    writeIDMap(pid, primaryIDMap, type);
+        auto gidmap = readIDMapFile("/proc/self/gid_map", IDMapping::T::Group);
+        writeIDMap(pid, primaryIDMap, IDMapping::T::Group, false, gidmap);
+    }
 }
 
 //* Mount ID-mapping
 
-void SandboxIDMap::recordMountIDMap(IDMap::Vec map)
+void SandboxIDMap::recordMountIDMap(IDMap idmap)
 {
-    for (auto m : map)
+    for (auto m : idmap.collectBoth())
         primaryIDMap.add_fallback(m);
 }
 
-int SandboxIDMap::getIDMapUserNsFd(IDMap::Vec idmap)
+int SandboxIDMap::getIDMapUserNsFd(IDMap idmap)
 {
     if (idmap.empty())
         return -1;
-
-    IDMap map(idmap);
 
     /* Little convenience: if the target 1000:100 (either) is mapped in
        the mount, then modify it to match with the build user's host map
@@ -519,13 +523,13 @@ int SandboxIDMap::getIDMapUserNsFd(IDMap::Vec idmap)
        becomes the mapping into the builder's *mapped* (=sandbox) IDs. (So
        you can have builders with a mapped UID 1000 and randomly
        changing host UID and filesystem) */
-    map.transform(IDMapping::T::User, sandboxUid(), hostUid());
-    map.transform(IDMapping::T::Group, sandboxGid(), hostGid());
+    idmap.transform(IDMapping::T::User, sandboxUid(), hostUid);
+    idmap.transform(IDMapping::T::Group, sandboxGid(), hostGid);
 
     // Create new user ns and get its fd, unless the same mapping already
     // has a stored fd in which case copy that.
     auto [fds, _] =
-        userNamespaceFDs.try_emplace(map.collectBoth(), [&] { return createUsernamespaceWithMappings(map); }());
+        userNamespaceFDs.try_emplace(idmap.collectBoth(), [&] { return createUsernamespaceWithMappings(idmap); }());
     auto fd = fds->second.get();
 
     return fd;
