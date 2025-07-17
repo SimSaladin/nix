@@ -223,23 +223,6 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
         return usingUserNamespace ? (!buildUser || buildUser->getUIDCount() == 1 ? 100 : 0) : buildUser->getGID();
     }
 
-    uid_t hostUid() const override
-    {
-        return buildUser ? buildUser->getUID() : getuid();
-    };
-    gid_t hostGid() const override
-    {
-        return buildUser ? buildUser->getGID() : getgid();
-    };
-    uint nrUids() const override
-    {
-        return buildUser ? buildUser->getUIDCount() : 1;
-    };
-    uint nrGids() const override
-    {
-        return buildUser ? buildUser->getUIDCount() : 1;
-    };
-
     bool useSupplementaryGroups() const override
     {
         return usingUserNamespace && getuid() == 0;
@@ -539,6 +522,11 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
             /* Set the UID/GID mapping of the builder's user namespace
                such that the sandbox user maps to the build user, or to
                the calling user (if build users are disabled). */
+            uid_t uid = buildUser ? buildUser->getUID() : getuid();
+            gid_t gid = buildUser ? buildUser->getGID() : getgid();
+            uint nrIds = buildUser ? buildUser->getUIDCount() : 1;
+            setPrimaryID(uid, gid, nrIds);
+
             writeIDMapFiles(pid);
         } else {
             debug("note: not using a user namespace");
