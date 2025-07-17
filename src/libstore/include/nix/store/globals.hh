@@ -526,7 +526,7 @@ public:
           define that group then GID 10100 is used instead on the host side as
           well.
         )",
-        {"build-supplementary-groups"}};
+        {"build-supplementary-groups"}, true, {}, true};
     #endif
 
     #ifdef __linux__
