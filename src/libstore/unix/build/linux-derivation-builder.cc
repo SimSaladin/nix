@@ -5,7 +5,9 @@
 #  include "nix/util/linux-namespaces.hh"
 #  include "nix/util/mount.hh"
 #  include "linux/fchmodat2-compat.hh"
+#  include "nix/util/idmaps.hh"
 
+#  include <fstream>
 #  include <sys/ioctl.h>
 #  include <net/if.h>
 #  include <netinet/ip.h>
@@ -139,7 +141,7 @@ struct LinuxDerivationBuilder : DerivationBuilderImpl
     }
 };
 
-struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
+struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
 {
     /**
      * Pipe for synchronising updates to the builder namespaces.
@@ -185,14 +187,19 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         DerivationBuilderImpl::deleteTmpDir(force);
     }
 
-    uid_t sandboxUid()
+    uid_t sandboxUid() const override
     {
         return usingUserNamespace ? (!buildUser || buildUser->getUIDCount() == 1 ? 1000 : 0) : buildUser->getUID();
     }
 
-    gid_t sandboxGid()
+    gid_t sandboxGid() const override
     {
         return usingUserNamespace ? (!buildUser || buildUser->getUIDCount() == 1 ? 100 : 0) : buildUser->getGID();
+    }
+
+    bool useSupplementaryGroups() const override
+    {
+        return usingUserNamespace && getuid() == 0;
     }
 
     bool needsHashRewrite() override
@@ -315,14 +322,13 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
         if (drvOptions.useUidRange(drv) && (!buildUser || buildUser->getUIDCount() < 65536))
             throw Error("feature 'uid-range' requires the setting '%s' to be enabled", settings.autoAllocateUids.name);
 
+        /* Get supplementary groups. */
+        addSupplementaryGroups(
+            settings.supplementaryGroups.get(), buildUser ? buildUser->getSupplementaryGIDs() : std::vector<gid_t>{});
+
         /* Declare the build user's group so that programs get a consistent
            view of the system (e.g., "id -gn"). */
-        writeFile(
-            chrootRootDir + "/etc/group",
-            fmt("root:x:0:\n"
-                "nixbld:!:%1%:\n"
-                "nogroup:x:65534:\n",
-                sandboxGid()));
+        writeGroupsFile(chrootRootDir + "/etc/group");
 
         /* Create /etc/hosts with localhost entry. */
         if (derivationType.isSandboxed())
@@ -426,6 +432,9 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 
         usingUserNamespace = userNamespacesSupported();
 
+        /** Get supplementary GIDs for sandbox. */
+        auto supplementaryGroups = supplementaryHostGIDs();
+
         Pipe sendPid;
         sendPid.create();
 
@@ -438,9 +447,9 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             openSlave();
 
             try {
-                /* Drop additional groups here because we can't do it
+                /* Drop and/or set additional groups here because we can't do it
                    after we've created the new user namespace. */
-                if (setgroups(0, 0) == -1) {
+                if (setgroups(supplementaryGroups.size(), supplementaryGroups.data()) == -1) {
                     if (errno != EPERM)
                         throw SysError("setgroups failed");
                     if (settings.requireDropSupplementaryGroups)
@@ -487,16 +496,12 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
             /* Set the UID/GID mapping of the builder's user namespace
                such that the sandbox user maps to the build user, or to
                the calling user (if build users are disabled). */
-            uid_t hostUid = buildUser ? buildUser->getUID() : getuid();
-            uid_t hostGid = buildUser ? buildUser->getGID() : getgid();
-            uid_t nrIds = buildUser ? buildUser->getUIDCount() : 1;
+            uid_t uid = buildUser ? buildUser->getUID() : getuid();
+            gid_t gid = buildUser ? buildUser->getGID() : getgid();
+            uint nrIds = buildUser ? buildUser->getUIDCount() : 1;
+            setPrimaryID(uid, gid, nrIds);
 
-            writeFile("/proc/" + std::to_string(pid) + "/uid_map", fmt("%d %d %d", sandboxUid(), hostUid, nrIds));
-
-            if (!buildUser || buildUser->getUIDCount() == 1)
-                writeFile("/proc/" + std::to_string(pid) + "/setgroups", "deny");
-
-            writeFile("/proc/" + std::to_string(pid) + "/gid_map", fmt("%d %d %d", sandboxGid(), hostGid, nrIds));
+            writeIDMapFiles(pid);
         } else {
             debug("note: not using a user namespace");
             if (!buildUser)
@@ -506,14 +511,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder
 
         /* Now that we now the sandbox uid, we can write
            /etc/passwd. */
-        writeFile(
-            chrootRootDir + "/etc/passwd",
-            fmt("root:x:0:0:Nix build user:%3%:/noshell\n"
-                "nixbld:x:%1%:%2%:Nix build user:%3%:/noshell\n"
-                "nobody:x:65534:65534:Nobody:/:/noshell\n",
-                sandboxUid(),
-                sandboxGid(),
-                settings.sandboxBuildDir));
+        writePasswdFile(chrootRootDir + "/etc/passwd", settings.sandboxBuildDir);
 
         /* Save the mount- and user namespace of the child. We have to do this
          *before* the child does a chroot. */
