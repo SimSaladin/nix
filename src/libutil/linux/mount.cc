@@ -219,6 +219,13 @@ void MountOpts::setOption(MountOpt opt)
     }
 };
 
+void MountOpts::setIDMap(int fd, const bool rec)
+{
+    auto at = (rec && rec_) ? &attrRec_ : &attr_;
+    at->attr_set |= MOUNT_ATTR_IDMAP;
+    at->userns_fd = static_cast<uint64_t>(fd);
+}
+
 void BindMountPathImpl::prepare()
 {
     mountOpts_ = MountOpts(getOptions(), isRecursive());
@@ -259,11 +266,11 @@ bool BindMountPathImpl::openTree()
     return true;
 };
 
-void BindMountPathImpl::bindMount(const Path & target)
+void BindMountPathImpl::bindMount(const Path & target, int usernsFd)
 {
     if (!prepared)
         prepare();
-    if (!useNewAPI)
+    if (!useNewAPI && usernsFd == -1)
         return mountLegacy(target);
 
     const auto setattr = [this, &target](struct mount_attr attr, bool rec) {
@@ -302,6 +309,9 @@ void BindMountPathImpl::bindMount(const Path & target)
             writeFile(target, "");
         }
     }
+
+    if (usernsFd > 0)
+        mountOpts_.setIDMap(usernsFd, sourceIsDir && isRecursive());
 
     // Apply recursive options first.
     if (sourceIsDir && isRecursive()) {

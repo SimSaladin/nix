@@ -309,6 +309,7 @@ void from_json(const nlohmann::json & j, SandboxPath & r)
             else if (k == "readOnly") v.get_to(r.readOnly);
             else if (k == "recursive") v.get_to(r.recursive);
             else if (k == "options") v.get_to(r.options);
+            else if (k == "idmap") v.get_to(r.idmap);
             else warn("unrecognized key '%s' in sandbox path", k);
         }
     else if (j.is_string()) j.get_to(r.source);
@@ -334,6 +335,7 @@ void to_json(nlohmann::json & j, const std::pair<Path, SandboxPath> & pair)
 #endif
         (v.options);
     if (opts != def.options) j.emplace("options", opts);
+    if (v.idmap != def.idmap) j.emplace("idmap", v.idmap);
 };
 
 void from_json(const nlohmann::json & j, SandboxPaths & r)

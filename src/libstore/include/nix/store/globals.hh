@@ -36,6 +36,7 @@ struct SandboxPath
 public:
 #ifndef __linux__
     using MountOpt = std::string;
+    using IDMap = nlohmann::json;
 #endif
 
     Path source;
@@ -57,6 +58,8 @@ public:
 
     std::vector<MountOpt> options;
 
+    IDMap idmap;
+
     /* This template is to enable the full implicit conversion from e.g. const
      * char[], even when binding a reference. Code can specify paths with
      * literals and nothing extra. */
@@ -66,12 +69,14 @@ public:
         bool optional = false,
         bool readOnly = false,
         bool recursive = true,
-        std::initializer_list<MountOpt> opts = {})
+        std::initializer_list<MountOpt> opts = {},
+        IDMap idmap = {})
     : source(std::forward<SomePath>(src))
     , optional(optional)
     , readOnly(readOnly)
     , recursive(recursive)
     , options(std::move(opts))
+    , idmap(std::move(idmap))
     {
     }
 
@@ -898,6 +903,37 @@ public:
              can set both at the same time if you specify the non-recursive
              value after any recursive value.
 
+          6. `idmap` (string | array of (string | object))
+
+             Creates an ID-mapped bind-mount. For more details see
+             `X-mount.idmap` in `mount(8)`.
+
+             The syntax for the string form is
+             `[id-type:]id-mount[:id-host[:id-range]]`, where
+             `id-type` is either `u` for UID map, `g` for GID map or `b` for both types,
+             `id-mount` defines the first ID mapped inside the sandbox,
+             `id-host` is the first ID outside the sandbox (e.g. in the filesystem),
+             and the `id-range` parameter indicates how many IDs are to be mapped (default: 1).
+
+             Multiple mappings can be given by separating them with ",". For
+             example, `u:30000:1000,g:30000:100:1` will map UID 1000 and
+             GID 100 (primary IDs of the build user) to ID 30000 in the host
+             filesystem.
+
+             Note that by default only UID 1000 and GID 100 are mapped in the
+             sandbox. To make use of other GIDs this should be combined with
+             [`supplementary-groups`](#conf-supplementary-groups`). Unmapped
+             IDs are not usable in the sandbox.
+
+             Example: CCache directory that is `root:root` is shared as read-write for nix builders:
+
+             > ```json
+             > { "/var/cache/ccache" : { "idmap" : [ "u:1000:0", "g:100:0" ] }}
+             > ```
+
+             Linux 5.12+ only. Only some filesystems support ID-mapped mounts.
+             See `mount_setattr(2)` for a list.
+
           | New (JSON)                                 | Old                     |
           |--------------------------------------------|-------------------------|
           | `{"/bin/sh": {}}`                          | `/bin/sh`               |
@@ -909,7 +945,7 @@ public:
           Depending on how Nix was built, the default value for this option
           may be empty or provide `/bin/sh` as a bind-mount of `bash`.
         )",
-        {"build-chroot-dirs", "build-sandbox-paths"}};
+        {"build-chroot-dirs", "build-sandbox-paths"}, true, {}, "object"};
 
     Setting<bool> sandboxFallback{this, true, "sandbox-fallback",
         "Whether to disable sandboxing when the kernel doesn't allow it."};

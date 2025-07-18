@@ -148,6 +148,7 @@ public:
     /* modify */
     void update(std::optional<bool> rec = std::nullopt);
     void append(const std::vector<MountOpt> & newOpts);
+    void setIDMap(int fd, const bool rec);
 };
 
 class BindMountPathImpl
@@ -177,7 +178,7 @@ public:
         MountOpt::private_rec,
     };
 
-    void bindMount(const Path &);
+    void bindMount(const Path &, int usernsFd = -1);
     virtual void prepare();
 };
 
