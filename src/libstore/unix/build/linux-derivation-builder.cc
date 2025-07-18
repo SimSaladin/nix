@@ -124,10 +124,60 @@ static void setupSeccomp()
 #  endif
 }
 
-static void doBind(SandboxPath v, const Path & target)
+static constexpr char SANDBOX_SYNC_UPDATED_NAMESPACE = '1';
+static constexpr char SANDBOX_SYNC_MSG_IDMAP_MOUNT = 'M';
+static constexpr char SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK = 'm';
+static constexpr char SANDBOX_SYNC_PAUSED_BEFORE_CHROOT = 'C';
+static constexpr char SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK = 'c';
+
+/**
+ * Extended bind-mount routine using the new mount fd API. Supports
+ * idmapping etc.
+ *
+ * ID-mapped bind mounts. Setup these from the parent (initial)
+ * namespace, because here we still have all the needed capabilities and
+ * are not constrained by the sandbox user ns. For every unique ID-map a
+ * user namespace is created with the specified mappings. Various criteria
+ * are required:
+ *
+ * - The caller needs to be owner of current user namespace.
+ * - The caller UID/GID has to be mapped in the current namespace.
+ * - The mapped user IDs (group IDs) must in turn have a mapping in the parent user namespace.
+ * - Mapping UID 0 requires CAP_SETFCAP
+ * - To write maps for other than effective UID/GID, CAP_SETUID/GID is needed.
+ * - A child user namespace inherits the /proc/pid/setgroups setting from its parent and can't modify it.
+ *
+ * Mounts are performed in the sandbox's mount namespace.
+ */
+void doBind(SandboxPath v, const Path & target, int sandboxMountNamespaceFd = -1, int idmapUserNsFd = -1)
 {
-    v.bindMount(target);
-}
+    if (sandboxMountNamespaceFd == -1)
+        return v.bindMount(target);
+
+    auto wrapper = [&]() {
+        try {
+            // set mount namespace
+            if (setns(sandboxMountNamespaceFd, 0) == -1)
+                throw SysError("entering sandbox mount namespace");
+
+            v.bindMount(target, idmapUserNsFd);
+
+        } catch (Error & e) {
+            debug("mount error: %s", e.message());
+            _exit(1);
+        }
+        _exit(0);
+    };
+
+    /* Bind-mount the path into the sandbox. This requires
+       entering its mount namespace, which is not possible
+       in multithreaded programs. So we do this in a
+       child process.*/
+    Pid child(startProcess([&]() { wrapper(); }));
+    int status = child.wait();
+    if (status != 0)
+        throw Error("could not add mount to sandbox: %s", target);
+};
 
 struct LinuxDerivationBuilder : DerivationBuilderImpl
 {
@@ -145,8 +195,10 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
 {
     /**
      * Pipe for synchronising updates to the builder namespaces.
+     * Another for synchronising updates in the other direction.
      */
     Pipe userNamespaceSync;
+    Pipe sandboxControl;
 
     /**
      * The mount namespace and user namespace of the builder, used to add additional
@@ -378,6 +430,12 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
             chownToBuilder(*cgroup + "/cgroup.threads");
             // chownToBuilder(*cgroup + "/cgroup.subtree_control");
         }
+
+        // Chroot paths that specify id-maps need to be mounted differently
+        // than  others...
+        for (auto & i : pathsInChroot)
+            if (!i.second.idmap.empty())
+                recordMountIDMap(i.second.idmap);
     }
 
     Strings getPreBuildHookArgs() override
@@ -429,17 +487,15 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
         */
 
         userNamespaceSync.create();
+        sandboxControl.create();
 
         usingUserNamespace = userNamespacesSupported();
 
         /** Get supplementary GIDs for sandbox. */
         auto supplementaryGroups = supplementaryHostGIDs();
 
-        Pipe sendPid;
-        sendPid.create();
-
         Pid helper = startProcess([&]() {
-            sendPid.readSide.close();
+            sandboxControl.readSide.close();
 
             /* We need to open the slave early, before
                CLONE_NEWUSER. Otherwise we get EPERM when running as
@@ -466,7 +522,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
 
                 pid_t child = startProcess([&]() { runChild(); }, options);
 
-                writeFull(sendPid.writeSide.get(), fmt("%d\n", child));
+                writeLine(sandboxControl.writeSide.get(), fmt("%d", child));
                 _exit(0);
             } catch (...) {
                 handleChildException(true);
@@ -474,7 +530,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
             }
         });
 
-        sendPid.writeSide.close();
+        sandboxControl.writeSide.close();
 
         if (helper.wait() != 0) {
             processSandboxSetupMessages();
@@ -484,13 +540,51 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
 
         userNamespaceSync.readSide = -1;
 
-        /* Close the write side to prevent runChild() from hanging
-           reading from this. */
-        Finally cleanup([&]() { userNamespaceSync.writeSide = -1; });
 
-        auto ss = tokenizeString<std::vector<std::string>>(readLine(sendPid.readSide.get()));
+        auto ss = tokenizeString<std::vector<std::string>>(readLine(sandboxControl.readSide.get()));
         assert(ss.size() == 1);
         pid = string2Int<pid_t>(ss[0]).value();
+
+        /* After the initial PID response (from child) process any other
+         * messages sent from the builder process during setup. */
+        std::thread([this,
+                fdr = sandboxControl.readSide.get(),
+                fdw = userNamespaceSync.writeSide.get()] {
+
+            /* Close the write side to prevent runChild() from hanging
+               reading from this. */
+            Finally cleanup([&]() { userNamespaceSync.writeSide = -1; });
+
+            auto writeResponse = [fdw](const char st) { writeFull(fdw, fmt("%c\n", st)); };
+            try {
+                while (1) {
+                    auto ln = readLine(fdr);
+                    if (ln.empty())
+                        continue;
+                    auto tail = ln.substr(1);
+                    switch (ln[0]) {
+                        case SANDBOX_SYNC_MSG_IDMAP_MOUNT: {
+                            auto v = pathsInChroot.at(tail);
+                            doBind(v, chrootRootDir + tail, sandboxMountNamespace.get(), getIDMapUserNsFd(v.idmap));
+                            writeResponse(SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK);
+                            continue;
+                            break;
+                        }
+                        case SANDBOX_SYNC_PAUSED_BEFORE_CHROOT: {
+                            writeResponse(SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK);
+                            break;
+                        }
+                        default: {
+                            throw Error("Unexpected input from build setup: %c%s", ln[0], tail);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            catch (EndOfFile &) { }
+            catch (...) { handleChildException(true); }
+        }).detach();
 
         if (usingUserNamespace) {
             /* Set the UID/GID mapping of the builder's user namespace
@@ -530,17 +624,28 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
             writeFile(*cgroup + "/cgroup.procs", fmt("%d", (pid_t) pid));
 
         /* Signal the builder that we've updated its user namespace. */
-        writeFull(userNamespaceSync.writeSide.get(), "1");
+        writeFull(userNamespaceSync.writeSide.get(), fmt("%c\n", SANDBOX_SYNC_UPDATED_NAMESPACE));
     }
 
     void enterChroot() override
     {
         userNamespaceSync.writeSide = -1;
 
-        if (drainFD(userNamespaceSync.readSide.get()) != "1")
-            throw Error("user namespace initialisation failed");
+        /* Expect a string from parent, indicates All OK so far. Throws if
+         * parent sends something unexpected or if the read itself raises exc. */
+        auto syncNamespaceExpect = [fd = userNamespaceSync.readSide.get()](const char expect, bool eofok = false) {
+            debug("builder setup synchronising on '%s'", expect);
+            try {
+                auto ln = readLine(fd);
+                if (expect != ln[0])
+                    throw Error("user namespace initialisation failed (expected: %s, received: %s)", expect, ln);
+            } catch (EndOfFile &) {
+                if (eofok || expect != '\0')
+                    throw Error("user namespace initialisation failed");
+            }
+        };
 
-        userNamespaceSync.readSide = -1;
+        syncNamespaceExpect(SANDBOX_SYNC_UPDATED_NAMESPACE, true);
 
         if (derivationType.isSandboxed()) {
 
@@ -670,8 +775,15 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
                 chmod_(dst, 0555);
             } else
 #  endif
-            {
+            if (i.second.idmap.empty())
                 i.second.bindMount(chrootRootDir + i.first);
+            else {
+                /** In order to do ID-mapping mounts without much restrictions
+                 * from kernel we make the parent do all the work from its
+                 * (usually initial) user namespace. */
+                writeLine(sandboxControl.writeSide.get(), fmt("%c%s", SANDBOX_SYNC_MSG_IDMAP_MOUNT, i.first));
+                // Wait for the parent to perform the mount
+                syncNamespaceExpect(SANDBOX_SYNC_MSG_IDMAP_MOUNT_ACK);
             }
         }
 
@@ -722,6 +834,14 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
         /* Make /etc unwritable */
         if (!drvOptions.useUidRange(drv))
             chmod_(chrootRootDir + "/etc", 0555);
+
+        /* Last pause before jailing into the build chroot.
+         * Optionally synchronising progress wih parent; this isn't necessary
+         * unless you altered the sandbox asynchronously from a different thread.
+         * (Re: id-mapped mounts, we wait for each mount individually
+         * already above.) */
+        writeLine(sandboxControl.writeSide.get(), fmt("%c", SANDBOX_SYNC_PAUSED_BEFORE_CHROOT));
+        syncNamespaceExpect(SANDBOX_SYNC_PAUSED_BEFORE_CHROOT_ACK);
 
         /* Unshare this mount namespace. This is necessary because
            pivot_root() below changes the root of the mount
@@ -833,25 +953,7 @@ struct ChrootLinuxDerivationBuilder : LinuxDerivationBuilder, SandboxIDMap
             throw Error("store path '%s' already exists in the sandbox", store.printStorePath(path));
         }
 
-        /* Bind-mount the path into the sandbox. This requires
-           entering its mount namespace, which is not possible
-           in multithreaded programs. So we do this in a
-           child process.*/
-        Pid child(startProcess([&]() {
-            if (usingUserNamespace && (setns(sandboxUserNamespace.get(), 0) == -1))
-                throw SysError("entering sandbox user namespace");
-
-            if (setns(sandboxMountNamespace.get(), 0) == -1)
-                throw SysError("entering sandbox mount namespace");
-
-            doBind(source, target);
-
-            _exit(0);
-        }));
-
-        int status = child.wait();
-        if (status != 0)
-            throw Error("could not add path '%s' to sandbox", store.printStorePath(path));
+        doBind(source, target, sandboxMountNamespace.get());
     }
 };
 

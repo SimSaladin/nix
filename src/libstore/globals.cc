@@ -312,6 +312,7 @@ void to_json(nlohmann::json & j, const SandboxPath & v, const Path & target)
                 v.options
 #endif
         );
+    if (v.idmap != def.idmap) j.emplace("idmap", v.idmap);
 };
 void to_json(nlohmann::json & j, const SandboxPath & v) { to_json(j, v, ""); }
 
@@ -326,6 +327,7 @@ void from_json(const nlohmann::json & j, SandboxPath & out)
         out.readOnly = j.value("readOnly", out.readOnly);
         out.recursive = j.value("recursive", out.recursive);
         out.options = j.value("options", out.options);
+        out.idmap = j.value("idmap", out.idmap);
     }
 };
 

@@ -222,12 +222,12 @@ bool BindMountPathImpl::openTree()
     return true;
 };
 
-void BindMountPathImpl::bindMount(const Path & target)
+void BindMountPathImpl::bindMount(const Path & target, int usernsFd)
 {
     if (!prepared)
         prepare();
 
-    if (!useNewAPI)
+    if (!useNewAPI && usernsFd == -1)
         return mountLegacy(target);
 
     const auto setattr = [this, &target](struct mount_attr attr, bool rec, auto flags) {
@@ -265,6 +265,13 @@ void BindMountPathImpl::bindMount(const Path & target)
             createDirs(dirOf(target));
             writeFile(target, "");
         }
+    }
+
+    if (usernsFd > 0) {
+        auto * at = (sourceIsDir && isRecursive()) ? &attrRec : &attr;
+        at->attr_set |= MOUNT_ATTR_IDMAP;
+        // FD's are int, except when ABI compatibility requires otherwise
+        at->userns_fd = static_cast<uint64_t>(usernsFd);
     }
 
     // Apply recursive options first.

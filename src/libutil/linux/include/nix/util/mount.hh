@@ -178,7 +178,7 @@ public:
         MountOpt::private_rec,
     };
     virtual void prepare();
-    virtual void bindMount(const Path &);
+    virtual void bindMount(const Path &, int usernsFd = -1);
     static std::vector<MountOpt> compactMountOpts(const std::vector<MountOpt> &);
 protected:
     bool useNewAPI = false;
