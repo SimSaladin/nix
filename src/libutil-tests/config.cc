@@ -202,7 +202,8 @@ TEST(Config, toJSONOnNonEmptyConfig)
               "description": "description\n",
               "documentDefault": true,
               "value": "value",
-              "experimentalFeature": null
+              "experimentalFeature": null,
+              "jsonSchema": null
             }
           })#"_json);
 }
@@ -231,7 +232,8 @@ TEST(Config, toJSONOnNonEmptyConfigWithExperimentalSetting)
               "description": "description\n",
               "documentDefault": true,
               "value": "value",
-              "experimentalFeature": "flakes"
+              "experimentalFeature": "flakes",
+              "jsonSchema": null
             }
           })#"_json);
 }
